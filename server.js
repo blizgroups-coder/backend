@@ -5,21 +5,10 @@ const { createClient } = require("@supabase/supabase-js");
 const app = express();
 app.use(bodyParser.json());
 
-/* 🔐 SUPABASE CONFIG (FIXED FOR sb_secret KEY) */
+/* 🔐 SUPABASE CONFIG (FINAL FIX) */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  {
-    auth: {
-      persistSession: false,
-      autoRefreshToken: false
-    },
-    global: {
-      headers: {
-        Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`
-      }
-    }
-  }
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 /* 🔍 DEBUG */
