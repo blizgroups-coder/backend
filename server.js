@@ -11,6 +11,10 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// 🔍 DEBUG
+console.log("URL:", process.env.SUPABASE_URL);
+console.log("KEY EXISTS:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+
 /* 💳 PAYPAL SUCCESS */
 app.post("/paypal-success", async (req, res) => {
   try {
@@ -40,7 +44,6 @@ app.post("/paypal-success", async (req, res) => {
   }
 });
 
-/* 🚀 SERVER */
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
