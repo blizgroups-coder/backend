@@ -1,30 +1,43 @@
-async function getAccessToken() {
+app.post("/create-order", async (req, res) => {
+  console.log("🔥 /create-order HIT");
+
   try {
-    // 🔍 DEBUG HERE
-    console.log("CLIENT:", process.env.PAYPAL_CLIENT_ID);
-    console.log("SECRET:", process.env.PAYPAL_SECRET ? "EXISTS" : "MISSING");
+    const accessToken = await getAccessToken();
 
-    console.log("🔑 Getting PayPal access token...");
+    console.log("✅ Token received");
 
-    const response = await axios({
-      url: "https://api-m.sandbox.paypal.com/v1/oauth2/token",
-      method: "post",
-      auth: {
-        username: process.env.PAYPAL_CLIENT_ID,
-        password: process.env.PAYPAL_SECRET,
+    const response = await axios.post(
+      "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+      {
+        intent: "CAPTURE",
+        purchase_units: [
+          {
+            amount: {
+              currency_code: "USD",
+              value: "5.00",
+            },
+          },
+        ],
       },
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      data: "grant_type=client_credentials",
-    });
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-    console.log("✅ Access token success");
+    console.log("✅ ORDER CREATED");
 
-    return response.data.access_token;
+    res.json(response.data);
 
   } catch (error) {
-    console.log("❌ TOKEN ERROR:", error.response?.data || error.message);
-    throw error;
+    console.log("❌ CREATE ORDER ERROR FULL:", error);
+    console.log("❌ RESPONSE:", error.response?.data);
+
+    res.status(500).json({
+      error: "Create order failed",
+      details: error.response?.data || error.message,
+    });
   }
-}
+});
