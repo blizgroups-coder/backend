@@ -22,24 +22,29 @@ console.log("PAYPAL SECRET:", process.env.PAYPAL_SECRET ? "EXISTS" : "MISSING");
 /* 🔑 GET PAYPAL TOKEN */
 /* ===================================================== */
 async function getAccessToken() {
-  const response = await axios({
-    url: "https://api-m.sandbox.paypal.com/v1/oauth2/token",
-    method: "post",
-    auth: {
-      username: process.env.PAYPAL_CLIENT_ID,
-      password: process.env.PAYPAL_SECRET,
-    },
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    data: "grant_type=client_credentials",
-  });
+  try {
+    const response = await axios({
+      url: "https://api-m.sandbox.paypal.com/v1/oauth2/token",
+      method: "post",
+      auth: {
+        username: process.env.PAYPAL_CLIENT_ID,
+        password: process.env.PAYPAL_SECRET,
+      },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      data: "grant_type=client_credentials",
+    });
 
-  return response.data.access_token;
+    return response.data.access_token;
+  } catch (error) {
+    console.log("❌ TOKEN ERROR:", error.response?.data || error.message);
+    throw error;
+  }
 }
 
 /* ===================================================== */
-/* 💳 CREATE ORDER */
+/* 💳 CREATE ORDER (WITH DEEP LINK) */
 /* ===================================================== */
 app.post("/create-order", async (req, res) => {
   try {
@@ -59,6 +64,10 @@ app.post("/create-order", async (req, res) => {
             },
           },
         ],
+        application_context: {
+          return_url: "tunevora://success", // 🔥 IMPORTANT
+          cancel_url: "tunevora://cancel",
+        },
       },
       {
         headers: {
@@ -72,7 +81,10 @@ app.post("/create-order", async (req, res) => {
 
   } catch (error) {
     console.log("❌ CREATE ERROR:", error.response?.data || error.message);
-    res.status(500).json({ error: "Create order failed" });
+    res.status(500).json({
+      error: "Create order failed",
+      details: error.response?.data || error.message,
+    });
   }
 });
 
@@ -86,7 +98,7 @@ app.post("/capture-order", async (req, res) => {
     const { orderID, user_id } = req.body;
 
     if (!orderID || !user_id) {
-      return res.status(400).json({ error: "Missing data" });
+      return res.status(400).json({ error: "Missing orderID or user_id" });
     }
 
     const accessToken = await getAccessToken();
@@ -105,7 +117,10 @@ app.post("/capture-order", async (req, res) => {
     console.log("💰 PAYPAL RESPONSE:", capture.data);
 
     if (capture.data.status !== "COMPLETED") {
-      return res.status(400).json({ error: "Payment not completed" });
+      return res.status(400).json({
+        error: "Payment not completed",
+        status: capture.data.status,
+      });
     }
 
     /* 🔥 UPDATE USER */
@@ -135,6 +150,13 @@ app.post("/capture-order", async (req, res) => {
       details: err.response?.data || err.message,
     });
   }
+});
+
+/* ===================================================== */
+/* ❤️ HEALTH CHECK */
+/* ===================================================== */
+app.get("/", (req, res) => {
+  res.send("Server is running 🚀");
 });
 
 /* ===================================================== */
