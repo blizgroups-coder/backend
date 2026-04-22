@@ -21,20 +21,29 @@ console.log("KEY EXISTS:", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
 /* 🔑 PAYPAL ACCESS TOKEN */
 /* ===================================================== */
 async function getAccessToken() {
-  const response = await axios({
-    url: "https://api-m.sandbox.paypal.com/v1/oauth2/token",
-    method: "post",
-    auth: {
-      username: process.env.PAYPAL_CLIENT_ID,
-      password: process.env.PAYPAL_SECRET,
-    },
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    data: "grant_type=client_credentials",
-  });
+  try {
+    console.log("🔑 Getting PayPal access token...");
 
-  return response.data.access_token;
+    const response = await axios({
+      url: "https://api-m.sandbox.paypal.com/v1/oauth2/token",
+      method: "post",
+      auth: {
+        username: process.env.PAYPAL_CLIENT_ID,
+        password: process.env.PAYPAL_SECRET,
+      },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      data: "grant_type=client_credentials",
+    });
+
+    console.log("✅ Access token success");
+    return response.data.access_token;
+
+  } catch (error) {
+    console.log("❌ TOKEN ERROR:", error.response?.data || error.message);
+    throw error;
+  }
 }
 
 /* ===================================================== */
@@ -42,6 +51,8 @@ async function getAccessToken() {
 /* ===================================================== */
 app.post("/create-order", async (req, res) => {
   try {
+    console.log("🚀 /create-order called");
+
     const accessToken = await getAccessToken();
 
     const response = await axios.post(
@@ -65,20 +76,28 @@ app.post("/create-order", async (req, res) => {
       }
     );
 
+    console.log("✅ ORDER CREATED");
+
     res.json(response.data);
 
   } catch (error) {
-    console.log("❌ Create Order Error:", error.response?.data || error.message);
-    res.status(500).send("Error creating order");
+    console.log("❌ CREATE ORDER ERROR:", error.response?.data || error.message);
+
+    res.status(500).json({
+      error: "Create order failed",
+      details: error.response?.data || error.message
+    });
   }
 });
 
 /* ===================================================== */
-/* 💳 CAPTURE PAYMENT (REAL VERIFICATION) */
+/* 💳 CAPTURE PAYMENT */
 /* ===================================================== */
 app.post("/capture-order", async (req, res) => {
   try {
     const { orderID, user_id } = req.body;
+
+    console.log("💳 Capture request:", orderID, user_id);
 
     if (!orderID || !user_id) {
       return res.status(400).json({ error: "Missing orderID or user_id" });
@@ -86,7 +105,6 @@ app.post("/capture-order", async (req, res) => {
 
     const accessToken = await getAccessToken();
 
-    // 🔥 CAPTURE PAYMENT FROM PAYPAL
     const capture = await axios.post(
       `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderID}/capture`,
       {},
@@ -98,15 +116,12 @@ app.post("/capture-order", async (req, res) => {
       }
     );
 
-    const status = capture.data.status;
+    console.log("💰 Capture response:", capture.data.status);
 
-    console.log("💰 Payment status:", status);
-
-    if (status !== "COMPLETED") {
+    if (capture.data.status !== "COMPLETED") {
       return res.status(400).json({ error: "Payment not completed" });
     }
 
-    /* 🔥 UPDATE USER TO PREMIUM */
     const { data, error } = await supabase
       .from("profiles")
       .update({
@@ -117,45 +132,30 @@ app.post("/capture-order", async (req, res) => {
       .select();
 
     if (error) {
-      console.log("❌ Supabase error:", error);
+      console.log("❌ SUPABASE ERROR:", error);
       return res.status(500).json({ error: error.message });
     }
 
     res.json({
       success: true,
-      payment: capture.data,
       user: data,
     });
 
-  } catch (err) {
-    console.log("❌ Capture error:", err.response?.data || err.message);
-    res.status(500).json({ error: "Capture failed" });
+  } catch (error) {
+    console.log("❌ CAPTURE ERROR:", error.response?.data || error.message);
+
+    res.status(500).json({
+      error: "Capture failed",
+      details: error.response?.data || error.message
+    });
   }
 });
 
 /* ===================================================== */
-/* 💳 OLD SYSTEM (KEEP FOR TESTING) */
+/* 🧪 HEALTH CHECK (VERY IMPORTANT) */
 /* ===================================================== */
-app.post("/paypal-success", async (req, res) => {
-  try {
-    const { user_id } = req.body;
-
-    const { data, error } = await supabase
-      .from("profiles")
-      .update({
-        is_premium: true,
-        premium_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-      })
-      .eq("id", user_id)
-      .select();
-
-    if (error) return res.status(500).json({ error: error.message });
-
-    res.json({ success: true, user: data });
-
-  } catch (err) {
-    res.status(500).json({ error: "Server error" });
-  }
+app.get("/", (req, res) => {
+  res.send("Server is running ✅");
 });
 
 /* ===================================================== */
