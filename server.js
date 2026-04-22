@@ -4,6 +4,10 @@ app.post("/create-order", async (req, res) => {
   try {
     const accessToken = await getAccessToken();
 
+    if (!accessToken) {
+      throw new Error("No PayPal access token");
+    }
+
     console.log("✅ Token received");
 
     const response = await axios.post(
@@ -29,13 +33,13 @@ app.post("/create-order", async (req, res) => {
 
     console.log("✅ ORDER CREATED");
 
-    res.json(response.data);
+    return res.json(response.data);
 
   } catch (error) {
-    console.log("❌ CREATE ORDER ERROR FULL:", error);
-    console.log("❌ RESPONSE:", error.response?.data);
+    console.log("❌ CREATE ORDER ERROR:", error.message);
+    console.log("❌ DETAILS:", error.response?.data);
 
-    res.status(500).json({
+    return res.status(500).json({
       error: "Create order failed",
       details: error.response?.data || error.message,
     });
