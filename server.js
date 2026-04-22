@@ -1,64 +1,21 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const axios = require("axios");
-const { createClient } = require("@supabase/supabase-js");
-
-const app = express();
-app.use(bodyParser.json());
-
-/* 🔥 REQUEST LOG */
-app.use((req, res, next) => {
-  console.log("👉 Incoming:", req.method, req.url);
-  next();
-});
-
-/* 🔐 SUPABASE */
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-/* 🔑 PAYPAL TOKEN */
-async function getAccessToken() {
-  console.log("CLIENT:", process.env.PAYPAL_CLIENT_ID);
-  console.log("SECRET:", process.env.PAYPAL_SECRET ? "EXISTS" : "MISSING");
-
-  const response = await axios({
-    url: "https://api-m.sandbox.paypal.com/v1/oauth2/token",
-    method: "post",
-    auth: {
-      username: process.env.PAYPAL_CLIENT_ID,
-      password: process.env.PAYPAL_SECRET,
-    },
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    data: "grant_type=client_credentials",
-  });
-
-  return response.data.access_token;
-}
-
-/* 💳 CREATE ORDER */
-app.post("/create-order", async (req, res) => {
-  console.log("🔥 /create-order HIT");
-
+app.post("/capture-order", async (req, res) => {
   try {
+    const { orderID, user_id } = req.body;
+
+    if (!orderID || !user_id) {
+      return res.status(400).json({ error: "Missing orderID or user_id" });
+    }
+
+    console.log("📦 OrderID:", orderID);
+
     const accessToken = await getAccessToken();
 
+    console.log("🔑 Access Token OK");
+
+    // 🔥 CAPTURE PAYMENT
     const response = await axios.post(
-      "https://api-m.sandbox.paypal.com/v2/checkout/orders",
-      {
-        intent: "CAPTURE",
-        purchase_units: [
-          {
-            amount: {
-              currency_code: "USD",
-              value: "5.00",
-            },
-          },
-        ],
-      },
+      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderID}/capture`,
+      {},
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -67,42 +24,18 @@ app.post("/create-order", async (req, res) => {
       }
     );
 
-    console.log("✅ ORDER CREATED");
+    console.log("💰 FULL PAYPAL RESPONSE:", response.data);
 
-    res.json(response.data);
+    const status = response.data.status;
 
-  } catch (error) {
-    console.log("❌ CREATE ORDER ERROR:", error.message);
-    console.log("❌ DETAILS:", error.response?.data);
-
-    res.status(500).json({
-      error: "Create order failed",
-      details: error.response?.data || error.message,
-    });
-  }
-});
-
-/* 💳 CAPTURE */
-app.post("/capture-order", async (req, res) => {
-  try {
-    const { orderID, user_id } = req.body;
-
-    const accessToken = await getAccessToken();
-
-    const capture = await axios.post(
-      `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderID}/capture`,
-      {},
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-      }
-    );
-
-    if (capture.data.status !== "COMPLETED") {
-      return res.status(400).json({ error: "Payment not completed" });
+    if (status !== "COMPLETED") {
+      return res.status(400).json({
+        error: "Payment not completed",
+        status: status,
+      });
     }
 
+    // 🔥 UPDATE USER
     const { data, error } = await supabase
       .from("profiles")
       .update({
@@ -112,24 +45,23 @@ app.post("/capture-order", async (req, res) => {
       .eq("id", user_id)
       .select();
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) {
+      console.log("❌ Supabase error:", error);
+      return res.status(500).json({ error: error.message });
+    }
 
-    res.json({ success: true, user: data });
+    return res.json({
+      success: true,
+      payment: response.data,
+      user: data,
+    });
 
   } catch (err) {
-    console.log("❌ CAPTURE ERROR:", err.message);
-    res.status(500).json({ error: "Capture failed" });
+    console.log("❌ CAPTURE ERROR FULL:", err.response?.data || err.message);
+
+    return res.status(500).json({
+      error: "Capture failed",
+      details: err.response?.data || err.message,
+    });
   }
-});
-
-/* ❤️ HEALTH CHECK */
-app.get("/", (req, res) => {
-  res.send("Server is running 🚀");
-});
-
-/* 🚀 START SERVER */
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
 });
