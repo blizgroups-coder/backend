@@ -44,7 +44,7 @@ async function getAccessToken() {
 }
 
 /* ===================================================== */
-/* 💳 CREATE ORDER (WITH DEEP LINK) */
+/* 💳 CREATE ORDER */
 /* ===================================================== */
 app.post("/create-order", async (req, res) => {
   try {
@@ -65,7 +65,7 @@ app.post("/create-order", async (req, res) => {
           },
         ],
         application_context: {
-          return_url: "tunevora://success", // 🔥 IMPORTANT
+          return_url: "tunevora://success",
           cancel_url: "tunevora://cancel",
         },
       },
@@ -81,6 +81,7 @@ app.post("/create-order", async (req, res) => {
 
   } catch (error) {
     console.log("❌ CREATE ERROR:", error.response?.data || error.message);
+
     res.status(500).json({
       error: "Create order failed",
       details: error.response?.data || error.message,
@@ -98,7 +99,9 @@ app.post("/capture-order", async (req, res) => {
     const { orderID, user_id } = req.body;
 
     if (!orderID || !user_id) {
-      return res.status(400).json({ error: "Missing orderID or user_id" });
+      return res.status(400).json({
+        error: "Missing orderID or user_id",
+      });
     }
 
     const accessToken = await getAccessToken();
@@ -123,18 +126,41 @@ app.post("/capture-order", async (req, res) => {
       });
     }
 
-    /* 🔥 UPDATE USER */
-    const { error } = await supabase
+    /* 🔥 UPDATE USER PREMIUM */
+    const { error: userError } = await supabase
       .from("profiles")
       .update({
         is_premium: true,
-        premium_until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        premium_until: new Date(
+          Date.now() + 30 * 24 * 60 * 60 * 1000
+        ),
       })
       .eq("id", user_id);
 
-    if (error) {
-      console.log("❌ SUPABASE ERROR:", error);
-      return res.status(500).json({ error: error.message });
+    if (userError) {
+      console.log("❌ USER UPDATE ERROR:", userError);
+
+      return res.status(500).json({
+        error: userError.message,
+      });
+    }
+
+    /* 🔥 SAVE PAYMENT RECORD */
+    const { error: paymentError } = await supabase
+      .from("payments")
+      .insert({
+        user_id: user_id,
+        plan: "Premium Monthly",
+        amount: 5.00,
+        status: "completed",
+      });
+
+    if (paymentError) {
+      console.log("❌ PAYMENT INSERT ERROR:", paymentError);
+
+      return res.status(500).json({
+        error: paymentError.message,
+      });
     }
 
     res.json({
