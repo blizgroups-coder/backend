@@ -3,6 +3,11 @@ const bodyParser = require("body-parser");
 const axios = require("axios");
 const { createClient } = require("@supabase/supabase-js");
 
+const Stripe = require("stripe");
+
+const stripe = new Stripe(
+  process.env.STRIPE_SECRET_KEY
+);
 const app = express();
 app.use(bodyParser.json());
 
@@ -177,7 +182,47 @@ app.post("/capture-order", async (req, res) => {
     });
   }
 });
+/* ===================================================== */
+/* 💳 STRIPE PAYMENT INTENT */
+/* ===================================================== */
+app.post("/create-payment-intent", async (req, res) => {
+  try {
 
+    const { amount, currency } = req.body;
+
+    const paymentIntent =
+      await stripe.paymentIntents.create({
+
+        amount: amount,
+
+        currency: currency,
+
+        automatic_payment_methods: {
+          enabled: true,
+        },
+
+      });
+
+    res.json({
+
+      clientSecret:
+      paymentIntent.client_secret,
+
+    });
+
+  } catch (error) {
+
+    console.log(
+      "❌ STRIPE ERROR:",
+      error.message,
+    );
+
+    res.status(500).json({
+      error: error.message,
+    });
+
+  }
+});
 /* ===================================================== */
 /* ❤️ HEALTH CHECK */
 /* ===================================================== */
