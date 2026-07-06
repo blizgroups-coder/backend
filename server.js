@@ -55,6 +55,14 @@ app.post("/create-order", async (req, res) => {
   try {
     console.log("🔥 CREATE ORDER HIT");
 
+    const { user_id, plan, amount, currency } = req.body;
+
+    if (!user_id || !plan || !amount || !currency) {
+      return res.status(400).json({
+        error: "Missing user_id, plan, amount, or currency",
+      });
+    }
+
     const accessToken = await getAccessToken();
 
     const response = await axios.post(
@@ -63,9 +71,15 @@ app.post("/create-order", async (req, res) => {
         intent: "CAPTURE",
         purchase_units: [
           {
+            custom_id: JSON.stringify({
+              user_id,
+              plan,
+              amount,
+              currency,
+            }),
             amount: {
-              currency_code: "USD",
-              value: "5.00",
+              currency_code: currency.toUpperCase(),
+              value: Number(amount).toFixed(2),
             },
           },
         ],
@@ -83,7 +97,6 @@ app.post("/create-order", async (req, res) => {
     );
 
     res.json(response.data);
-
   } catch (error) {
     console.log("❌ CREATE ERROR:", error.response?.data || error.message);
 
@@ -131,14 +144,35 @@ app.post("/capture-order", async (req, res) => {
       });
     }
 
-    /* 🔥 UPDATE USER PREMIUM */
+    const purchaseUnit =
+      capture.data.purchase_units?.[0];
+
+    let paymentInfo = {};
+
+    try {
+      paymentInfo = JSON.parse(
+        purchaseUnit?.payments?.captures?.[0]?.custom_id ||
+          purchaseUnit?.custom_id ||
+          "{}"
+      );
+    } catch (e) {
+      paymentInfo = {};
+    }
+
+    const selectedPlan = paymentInfo.plan || "premium";
+    const paidAmount = Number(paymentInfo.amount || 0);
+    const paidCurrency = paymentInfo.currency || "USD";
+
+    const premiumUntil = new Date(
+      Date.now() + 30 * 24 * 60 * 60 * 1000
+    );
+
     const { error: userError } = await supabase
       .from("profiles")
       .update({
-        is_premium: true,
-        premium_until: new Date(
-          Date.now() + 30 * 24 * 60 * 60 * 1000
-        ),
+        is_premium: selectedPlan !== "free",
+        plan: selectedPlan,
+        premium_until: premiumUntil,
       })
       .eq("id", user_id);
 
@@ -150,13 +184,13 @@ app.post("/capture-order", async (req, res) => {
       });
     }
 
-    /* 🔥 SAVE PAYMENT RECORD */
     const { error: paymentError } = await supabase
       .from("payments")
       .insert({
         user_id: user_id,
-        plan: "Premium Monthly",
-        amount: 5.00,
+        plan: selectedPlan,
+        amount: paidAmount,
+        currency: paidCurrency,
         status: "completed",
       });
 
@@ -170,9 +204,8 @@ app.post("/capture-order", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Premium activated",
+      message: `${selectedPlan} activated`,
     });
-
   } catch (err) {
     console.log("❌ CAPTURE ERROR:", err.response?.data || err.message);
 
