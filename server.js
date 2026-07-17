@@ -858,6 +858,75 @@ app.post(
 );
 
 /* ===================================================== */
+/* 📢 CREATE STRIPE AD PAYMENT INTENT */
+/* ===================================================== */
+
+app.post(
+  "/create-ad-payment-intent",
+  async (req, res) => {
+    try {
+      console.log(
+        "🔥 CREATE AD PAYMENT INTENT"
+      );
+
+      const {
+        user_id,
+        campaign_id,
+        amount,
+        currency,
+      } = req.body;
+
+      if (
+        !user_id ||
+        !campaign_id ||
+        !amount ||
+        !currency
+      ) {
+        return res.status(400).json({
+          error: "Missing payment details",
+        });
+      }
+
+      const paymentIntent =
+        await stripe.paymentIntents.create({
+          amount: Number(amount),
+
+          currency: String(currency).toLowerCase(),
+
+          automatic_payment_methods: {
+            enabled: true,
+          },
+
+          metadata: {
+            payment_type: "advertisement",
+            user_id,
+            campaign_id,
+          },
+        });
+
+      return res.json({
+        clientSecret:
+          paymentIntent.client_secret,
+
+        paymentIntentId:
+          paymentIntent.id,
+      });
+
+    } catch (error) {
+
+      console.log(
+        "❌ AD STRIPE ERROR:",
+        error.message
+      );
+
+      return res.status(500).json({
+        error: error.message,
+      });
+    }
+  }
+);
+
+/* ===================================================== */
 /* ❤️ HEALTH CHECK */
 /* ===================================================== */
 
