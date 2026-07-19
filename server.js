@@ -931,6 +931,18 @@ app.post(
       /* --------------------------------------------- */
       /* Verify the campaign belongs to this user      */
       /* --------------------------------------------- */
+      
+      console.log(
+         "🔐 CAMPAIGN OWNERSHIP CHECK:",
+         {
+          campaign_created_by:
+            campaign.created_by,
+          request_user_id:
+            user_id,
+          matches:
+            campaign.created_by === user_id,
+        }
+      );    
 
       if (campaign.created_by !== user_id) {
         return res.status(403).json({
