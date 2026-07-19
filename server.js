@@ -813,7 +813,7 @@ app.post(
             amount,
 
             currency:
-              paymentCurrency,
+               paymentCurrency,
 
             automatic_payment_methods: {
               enabled: true,
@@ -872,37 +872,235 @@ app.post(
       const {
         user_id,
         campaign_id,
-        amount,
-        currency,
       } = req.body;
 
-      if (
-        !user_id ||
-        !campaign_id ||
-        !amount ||
-        !currency
-      ) {
+      /* --------------------------------------------- */
+      /* Validate required request data                */
+      /* --------------------------------------------- */
+
+      if (!user_id || !campaign_id) {
         return res.status(400).json({
-          error: "Missing payment details",
+          error:
+            "Missing user_id or campaign_id",
         });
       }
 
-      const paymentIntent =
-        await stripe.paymentIntents.create({
-          amount: Number(amount),
+      /* --------------------------------------------- */
+      /* Load real campaign values from Supabase       */
+      /* --------------------------------------------- */
 
-          currency: String(currency).toLowerCase(),
+      const {
+        data: campaign,
+        error: campaignError,
+      } = await supabase
+        .from("ad_campaigns")
+        .select(`
+          id,
+          ad_id,
+          budget,
+          currency,
+          created_by,
+          payment_status,
+          payment_id,
+          status
+        `)
+        .eq("id", campaign_id)
+        .maybeSingle();
 
-          automatic_payment_methods: {
-            enabled: true,
-          },
+      if (campaignError) {
+        console.log(
+          "❌ LOAD AD CAMPAIGN ERROR:",
+          campaignError
+        );
 
-          metadata: {
-            payment_type: "advertisement",
-            user_id,
-            campaign_id,
-          },
+        return res.status(500).json({
+          error:
+            "Could not load advertisement campaign",
+          details:
+            campaignError.message,
         });
+      }
+
+      if (!campaign) {
+        return res.status(404).json({
+          error:
+            "Advertisement campaign not found",
+        });
+      }
+
+      /* --------------------------------------------- */
+      /* Verify the campaign belongs to this user      */
+      /* --------------------------------------------- */
+
+      if (campaign.created_by !== user_id) {
+        return res.status(403).json({
+          error:
+            "You are not allowed to pay for this campaign",
+        });
+      }
+
+      /* --------------------------------------------- */
+      /* Prevent paying an already-paid campaign       */
+      /* --------------------------------------------- */
+
+      if (
+        String(
+          campaign.payment_status || ""
+        ).toLowerCase() === "paid"
+      ) {
+        return res.status(409).json({
+          error:
+            "This campaign has already been paid",
+          payment_id:
+            campaign.payment_id,
+        });
+      }
+
+      /* --------------------------------------------- */
+      /* Use server-side database budget               */
+      /* --------------------------------------------- */
+
+      const campaignBudget =
+        Number(campaign.budget);
+
+      if (
+        !Number.isFinite(campaignBudget) ||
+        campaignBudget <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Campaign budget is invalid",
+        });
+      }
+
+      const paymentCurrency =
+        String(campaign.currency || "USD")
+          .trim()
+          .toUpperCase();
+
+      const stripeCurrency =
+        paymentCurrency.toLowerCase();
+
+      /*
+       * Stripe expects the amount in the
+       * smallest currency unit.
+       *
+       * Example:
+       * 100 AED -> 10000 fils
+       */
+      const amountInSmallestUnit =
+        Math.round(
+          campaignBudget * 100
+        );
+
+      if (
+        !Number.isInteger(
+          amountInSmallestUnit
+        ) ||
+        amountInSmallestUnit <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Invalid campaign payment amount",
+        });
+      }
+
+      console.log(
+        "📢 AD CAMPAIGN PAYMENT:",
+        {
+          campaign_id:
+            campaign.id,
+          user_id,
+          budget:
+            campaignBudget,
+          currency:
+            paymentCurrency,
+          smallest_unit:
+            amountInSmallestUnit,
+        }
+      );
+
+      /* --------------------------------------------- */
+      /* Create Stripe PaymentIntent                   */
+      /* --------------------------------------------- */
+
+      const paymentIntent =
+        await stripe
+          .paymentIntents
+          .create({
+            amount:
+              amountInSmallestUnit,
+
+            currency:
+              stripeCurrency,
+
+            automatic_payment_methods: {
+              enabled: true,
+            },
+
+            metadata: {
+              payment_type:
+                "advertisement",
+
+              user_id,
+
+              campaign_id:
+                campaign.id,
+
+              ad_id:
+                campaign.ad_id || "",
+
+              campaign_budget:
+                campaignBudget.toFixed(2),
+
+              campaign_currency:
+                paymentCurrency.toUpperCase(),
+            },
+          });
+
+      /* --------------------------------------------- */
+      /* Save PaymentIntent ID before payment          */
+      /* --------------------------------------------- */
+
+      const {
+        error: updateError,
+      } = await supabase
+        .from("ad_campaigns")
+        .update({
+          payment_id:
+            paymentIntent.id,
+        })
+        .eq("id", campaign.id)
+        .eq("created_by", user_id);
+
+      if (updateError) {
+        console.log(
+          "❌ SAVE AD PAYMENT ID ERROR:",
+          updateError
+        );
+
+        /*
+         * Cancel the PaymentIntent so we do not leave
+         * an untracked payment open in Stripe.
+         */
+        try {
+          await stripe
+            .paymentIntents
+            .cancel(paymentIntent.id);
+        } catch (cancelError) {
+          console.log(
+            "⚠️ PAYMENT INTENT CANCEL ERROR:",
+            cancelError.message
+          );
+        }
+
+        return res.status(500).json({
+          error:
+            "Could not prepare advertisement payment",
+          details:
+            updateError.message,
+        });
+      }
 
       return res.json({
         clientSecret:
@@ -910,23 +1108,27 @@ app.post(
 
         paymentIntentId:
           paymentIntent.id,
+
+        amount:
+          campaignBudget,
+
+        currency:
+          paymentCurrency,
       });
-
     } catch (error) {
-
       console.log(
         "❌ AD STRIPE ERROR:",
-        error.message
+        error
       );
 
       return res.status(500).json({
-        error: error.message,
+        error:
+          error.message ||
+          "Advertisement payment intent failed",
       });
     }
   }
-);
-
-/* ===================================================== */
+);/* ===================================================== */
 /* ❤️ HEALTH CHECK */
 /* ===================================================== */
 
