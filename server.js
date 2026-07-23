@@ -1155,37 +1155,73 @@ app.post(
         "💰 CALCULATE PREMIUM PAYOUTS HIT"
       );
 
-      /* --------------------------------------------- */
-      /* Admin security                               */
-      /* --------------------------------------------- */
+     /* --------------------------------------------- */
+/* Secure Supabase admin authentication          */
+/* --------------------------------------------- */
 
-      const configuredSecret =
-        process.env.ADMIN_PAYOUT_SECRET;
+const authorizationHeader =
+  String(req.headers.authorization || "");
 
-      const receivedSecret =
-        String(
-          req.headers["x-admin-secret"] || ""
-        );
+const accessToken =
+  authorizationHeader.startsWith("Bearer ")
+    ? authorizationHeader.substring(7).trim()
+    : "";
 
-      if (!configuredSecret) {
-        console.log(
-          "❌ ADMIN_PAYOUT_SECRET IS NOT CONFIGURED"
-        );
+if (!accessToken) {
+  return res.status(401).json({
+    error: "Missing admin authentication token",
+  });
+}
 
-        return res.status(500).json({
-          error:
-            "Payout security is not configured",
-        });
-      }
+const {
+  data: authenticatedUserData,
+  error: authenticatedUserError,
+} = await supabase.auth.getUser(accessToken);
 
-      if (
-        receivedSecret !== configuredSecret
-      ) {
-        return res.status(401).json({
-          error:
-            "Unauthorized payout request",
-        });
-      }
+if (
+  authenticatedUserError ||
+  !authenticatedUserData?.user
+) {
+  console.log(
+    "❌ INVALID ADMIN TOKEN:",
+    authenticatedUserError
+  );
+
+  return res.status(401).json({
+    error: "Invalid or expired admin session",
+  });
+}
+
+const authenticatedUser =
+  authenticatedUserData.user;
+
+const authenticatedEmail =
+  String(
+    authenticatedUser.email || ""
+  )
+    .trim()
+    .toLowerCase();
+
+if (
+  authenticatedEmail !==
+  "tunevora@gmail.com"
+) {
+  console.log(
+    "❌ NON-ADMIN PAYOUT REQUEST:",
+    authenticatedEmail
+  );
+
+  return res.status(403).json({
+    error:
+      "Only the Tunevora administrator can calculate payouts",
+  });
+}
+
+console.log(
+  "✅ ADMIN PAYOUT AUTHENTICATED:",
+  authenticatedEmail
+);
+
 
       /* --------------------------------------------- */
       /* Select month and year                        */
