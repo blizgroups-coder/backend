@@ -1140,7 +1140,938 @@ app.post(
       });
     }
   }
-);/* ===================================================== */
+);
+
+
+/* ===================================================== */
+/* 💰 CALCULATE MONTHLY PREMIUM ARTIST PAYOUTS            */
+/* ===================================================== */
+
+app.post(
+  "/calculate-premium-payouts",
+  async (req, res) => {
+    try {
+      console.log(
+        "💰 CALCULATE PREMIUM PAYOUTS HIT"
+      );
+
+      /* --------------------------------------------- */
+      /* Admin security                               */
+      /* --------------------------------------------- */
+
+      const configuredSecret =
+        process.env.ADMIN_PAYOUT_SECRET;
+
+      const receivedSecret =
+        String(
+          req.headers["x-admin-secret"] || ""
+        );
+
+      if (!configuredSecret) {
+        console.log(
+          "❌ ADMIN_PAYOUT_SECRET IS NOT CONFIGURED"
+        );
+
+        return res.status(500).json({
+          error:
+            "Payout security is not configured",
+        });
+      }
+
+      if (
+        receivedSecret !== configuredSecret
+      ) {
+        return res.status(401).json({
+          error:
+            "Unauthorized payout request",
+        });
+      }
+
+      /* --------------------------------------------- */
+      /* Select month and year                        */
+      /* Defaults to previous month                   */
+      /* --------------------------------------------- */
+
+      const now = new Date();
+
+      const previousMonthDate =
+        new Date(
+          Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth() - 1,
+            1
+          )
+        );
+
+      const selectedMonth =
+        Number(
+          req.body?.month ||
+            previousMonthDate.getUTCMonth() +
+              1
+        );
+
+      const selectedYear =
+        Number(
+          req.body?.year ||
+            previousMonthDate.getUTCFullYear()
+        );
+
+      if (
+        !Number.isInteger(selectedMonth) ||
+        selectedMonth < 1 ||
+        selectedMonth > 12
+      ) {
+        return res.status(400).json({
+          error:
+            "Month must be between 1 and 12",
+        });
+      }
+
+      if (
+        !Number.isInteger(selectedYear) ||
+        selectedYear < 2020 ||
+        selectedYear > 2100
+      ) {
+        return res.status(400).json({
+          error:
+            "Invalid payout year",
+        });
+      }
+
+      const periodStart =
+        new Date(
+          Date.UTC(
+            selectedYear,
+            selectedMonth - 1,
+            1
+          )
+        );
+
+      const periodEnd =
+        new Date(
+          Date.UTC(
+            selectedYear,
+            selectedMonth,
+            1
+          )
+        );
+
+      const startIso =
+        periodStart.toISOString();
+
+      const endIso =
+        periodEnd.toISOString();
+
+      console.log(
+        "📅 PAYOUT PERIOD:",
+        {
+          month: selectedMonth,
+          year: selectedYear,
+          start: startIso,
+          end: endIso,
+        }
+      );
+
+      const paidPlans = [
+        "standard",
+        "premium",
+        "lossless",
+        "hires",
+      ];
+
+      /* --------------------------------------------- */
+      /* Helper: load all rows using pagination        */
+      /* --------------------------------------------- */
+
+      async function loadAllRows(
+        queryBuilder
+      ) {
+        const pageSize = 1000;
+
+        let from = 0;
+        let allRows = [];
+
+        while (true) {
+          const {
+            data,
+            error,
+          } = await queryBuilder(
+            from,
+            from + pageSize - 1
+          );
+
+          if (error) {
+            throw error;
+          }
+
+          const rows =
+            Array.isArray(data)
+              ? data
+              : [];
+
+          allRows =
+            allRows.concat(rows);
+
+          if (rows.length < pageSize) {
+            break;
+          }
+
+          from += pageSize;
+        }
+
+        return allRows;
+      }
+
+      /* --------------------------------------------- */
+      /* Load completed subscription payments          */
+      /* --------------------------------------------- */
+
+      const paymentRows =
+        await loadAllRows(
+          async (from, to) =>
+            await supabase
+              .from("payments")
+              .select(`
+                id,
+                user_id,
+                plan,
+                amount,
+                currency,
+                status,
+                created_at
+              `)
+              .eq(
+                "status",
+                "completed"
+              )
+              .in(
+                "plan",
+                paidPlans
+              )
+              .gte(
+                "created_at",
+                startIso
+              )
+              .lt(
+                "created_at",
+                endIso
+              )
+              .range(from, to)
+        );
+
+      const validPayments =
+        paymentRows.filter((payment) => {
+          const amount =
+            Number(payment.amount);
+
+          return (
+            Number.isFinite(amount) &&
+            amount > 0
+          );
+        });
+
+      /* --------------------------------------------- */
+      /* Prevent incorrect mixed-currency calculations */
+      /* --------------------------------------------- */
+
+      const paymentCurrencies =
+        [
+          ...new Set(
+            validPayments.map(
+              (payment) =>
+                String(
+                  payment.currency ||
+                    "USD"
+                ).toUpperCase()
+            )
+          ),
+        ];
+
+      if (
+        paymentCurrencies.length > 1
+      ) {
+        return res.status(409).json({
+          error:
+            "Multiple payment currencies were found for this month",
+          currencies:
+            paymentCurrencies,
+          message:
+            "Connect the live currency conversion service before calculating mixed-currency payouts",
+        });
+      }
+
+      const payoutCurrency =
+        paymentCurrencies[0] ||
+        "USD";
+
+      const totalPremiumRevenue =
+        validPayments.reduce(
+          (total, payment) =>
+            total +
+            Number(payment.amount || 0),
+          0
+        );
+
+      /*
+       * Tunevora model:
+       * 60% platform
+       * 40% artist pool
+       *
+       * Use integer cents to avoid
+       * floating-point payout errors.
+       */
+
+      const totalRevenueCents =
+        Math.round(
+          totalPremiumRevenue * 100
+        );
+
+      const artistPoolCents =
+        Math.round(
+          totalRevenueCents * 0.4
+        );
+
+      const platformShareCents =
+        totalRevenueCents -
+        artistPoolCents;
+
+      /* --------------------------------------------- */
+      /* Load subscriptions overlapping this month     */
+      /* --------------------------------------------- */
+
+      const subscriptionRows =
+        await loadAllRows(
+          async (from, to) =>
+            await supabase
+              .from("subscriptions")
+              .select(`
+                user_id,
+                plan,
+                status,
+                created_at,
+                expires_at
+              `)
+              .in(
+                "plan",
+                paidPlans
+              )
+              .lt(
+                "created_at",
+                endIso
+              )
+              .gte(
+                "expires_at",
+                startIso
+              )
+              .range(from, to)
+        );
+
+      /*
+       * Store each user's subscription
+       * start/end periods.
+       */
+
+      const subscriptionPeriodsByUser =
+        new Map();
+
+      for (
+        const subscription
+        of subscriptionRows
+      ) {
+        const userId =
+          subscription.user_id;
+
+        if (!userId) {
+          continue;
+        }
+
+        const subscriptionStart =
+          new Date(
+            subscription.created_at
+          );
+
+        const subscriptionEnd =
+          new Date(
+            subscription.expires_at
+          );
+
+        if (
+          Number.isNaN(
+            subscriptionStart.getTime()
+          ) ||
+          Number.isNaN(
+            subscriptionEnd.getTime()
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          !subscriptionPeriodsByUser.has(
+            userId
+          )
+        ) {
+          subscriptionPeriodsByUser.set(
+            userId,
+            []
+          );
+        }
+
+        subscriptionPeriodsByUser
+          .get(userId)
+          .push({
+            start:
+              subscriptionStart.getTime(),
+
+            end:
+              subscriptionEnd.getTime(),
+          });
+      }
+
+      /* --------------------------------------------- */
+      /* Load listening activity for selected month    */
+      /* --------------------------------------------- */
+
+      const playRows =
+        await loadAllRows(
+          async (from, to) =>
+            await supabase
+              .from("play_analytics")
+              .select(`
+                id,
+                song_id,
+                artist_id,
+                user_id,
+                listened_seconds,
+                song_duration_seconds,
+                created_at
+              `)
+              .gte(
+                "created_at",
+                startIso
+              )
+              .lt(
+                "created_at",
+                endIso
+              )
+              .range(from, to)
+        );
+
+      const streamsByArtist =
+        new Map();
+
+      let qualifiedPremiumStreams = 0;
+      let rejectedStreams = 0;
+
+      for (const play of playRows) {
+        const userId =
+          play.user_id;
+
+        const artistId =
+          play.artist_id;
+
+        const songId =
+          play.song_id;
+
+        if (
+          !userId ||
+          !artistId ||
+          !songId
+        ) {
+          rejectedStreams += 1;
+          continue;
+        }
+
+        const playDate =
+          new Date(play.created_at);
+
+        if (
+          Number.isNaN(
+            playDate.getTime()
+          )
+        ) {
+          rejectedStreams += 1;
+          continue;
+        }
+
+        const userSubscriptionPeriods =
+          subscriptionPeriodsByUser.get(
+            userId
+          );
+
+        if (
+          !userSubscriptionPeriods ||
+          userSubscriptionPeriods.length ===
+            0
+        ) {
+          rejectedStreams += 1;
+          continue;
+        }
+
+        const playTimestamp =
+          playDate.getTime();
+
+        const hadActiveSubscription =
+          userSubscriptionPeriods.some(
+            (period) =>
+              playTimestamp >=
+                period.start &&
+              playTimestamp <=
+                period.end
+          );
+
+        if (!hadActiveSubscription) {
+          rejectedStreams += 1;
+          continue;
+        }
+
+        const listenedSeconds =
+          Number(
+            play.listened_seconds || 0
+          );
+
+        const songDurationSeconds =
+          Number(
+            play.song_duration_seconds ||
+              0
+          );
+
+        /*
+         * A stream qualifies when:
+         * - listener played at least 30 seconds, or
+         * - song is shorter than 30 seconds and
+         *   at least 90% was played.
+         */
+
+        const normalQualified =
+          listenedSeconds >= 30;
+
+        const shortSongQualified =
+          songDurationSeconds > 0 &&
+          songDurationSeconds < 30 &&
+          listenedSeconds >=
+            songDurationSeconds * 0.9;
+
+        if (
+          !normalQualified &&
+          !shortSongQualified
+        ) {
+          rejectedStreams += 1;
+          continue;
+        }
+
+        streamsByArtist.set(
+          artistId,
+          (
+            streamsByArtist.get(
+              artistId
+            ) || 0
+          ) + 1
+        );
+
+        qualifiedPremiumStreams += 1;
+      }
+
+      /* --------------------------------------------- */
+      /* Calculate artist distribution in cents        */
+      /* --------------------------------------------- */
+
+      const artistCalculations = [];
+
+      if (
+        qualifiedPremiumStreams > 0 &&
+        artistPoolCents > 0
+      ) {
+        for (
+          const [
+            artistId,
+            streams,
+          ] of streamsByArtist.entries()
+        ) {
+          const exactCents =
+            (
+              streams /
+              qualifiedPremiumStreams
+            ) * artistPoolCents;
+
+          const baseCents =
+            Math.floor(exactCents);
+
+          artistCalculations.push({
+            artistId,
+            streams,
+            exactCents,
+            payoutCents:
+              baseCents,
+            remainder:
+              exactCents -
+              baseCents,
+          });
+        }
+
+        /*
+         * Distribute remaining cents to
+         * artists with the largest fractional
+         * remainder.
+         */
+
+        const distributedCents =
+          artistCalculations.reduce(
+            (
+              total,
+              calculation
+            ) =>
+              total +
+              calculation.payoutCents,
+            0
+          );
+
+        let remainingCents =
+          artistPoolCents -
+          distributedCents;
+
+        artistCalculations.sort(
+          (a, b) =>
+            b.remainder -
+            a.remainder
+        );
+
+        let remainderIndex = 0;
+
+        while (
+          remainingCents > 0 &&
+          artistCalculations.length > 0
+        ) {
+          artistCalculations[
+            remainderIndex %
+              artistCalculations.length
+          ].payoutCents += 1;
+
+          remainingCents -= 1;
+          remainderIndex += 1;
+        }
+      }
+
+      /* --------------------------------------------- */
+      /* Load existing monthly payout rows              */
+      /* --------------------------------------------- */
+
+      const {
+        data: existingPayoutRows,
+        error:
+          existingPayoutError,
+      } = await supabase
+        .from(
+          "premium_artist_payouts"
+        )
+        .select(`
+          id,
+          artist_id,
+          premium_streams,
+          artist_share,
+          currency,
+          status
+        `)
+        .eq(
+          "month",
+          selectedMonth
+        )
+        .eq(
+          "year",
+          selectedYear
+        );
+
+      if (existingPayoutError) {
+        throw existingPayoutError;
+      }
+
+      const existingByArtist =
+        new Map();
+
+      for (
+        const payout
+        of existingPayoutRows || []
+      ) {
+        existingByArtist.set(
+          payout.artist_id,
+          payout
+        );
+      }
+
+      const currentArtistIds =
+        new Set(
+          artistCalculations.map(
+            (item) =>
+              item.artistId
+          )
+        );
+
+      let insertedRows = 0;
+      let updatedRows = 0;
+      let protectedRows = 0;
+      let zeroedRows = 0;
+
+      /* --------------------------------------------- */
+      /* Save calculated payouts                       */
+      /* --------------------------------------------- */
+
+      for (
+        const calculation
+        of artistCalculations
+      ) {
+        const existing =
+          existingByArtist.get(
+            calculation.artistId
+          );
+
+        /*
+         * Never overwrite approved or paid
+         * payout records.
+         */
+
+        if (
+          existing &&
+          (
+            existing.status ===
+              "paid" ||
+            existing.status ===
+              "approved"
+          )
+        ) {
+          protectedRows += 1;
+          continue;
+        }
+
+        const payoutAmount =
+          calculation.payoutCents /
+          100;
+
+        if (existing) {
+          const {
+            error: updateError,
+          } = await supabase
+            .from(
+              "premium_artist_payouts"
+            )
+            .update({
+              premium_streams:
+                calculation.streams,
+
+              artist_share:
+                payoutAmount,
+
+              currency:
+                payoutCurrency,
+
+              status:
+                "pending",
+            })
+            .eq(
+              "id",
+              existing.id
+            );
+
+          if (updateError) {
+            throw updateError;
+          }
+
+          updatedRows += 1;
+        } else {
+          const {
+            error: insertError,
+          } = await supabase
+            .from(
+              "premium_artist_payouts"
+            )
+            .insert({
+              artist_id:
+                calculation.artistId,
+
+              month:
+                selectedMonth,
+
+              year:
+                selectedYear,
+
+              premium_streams:
+                calculation.streams,
+
+              artist_share:
+                payoutAmount,
+
+              currency:
+                payoutCurrency,
+
+              status:
+                "pending",
+            });
+
+          if (insertError) {
+            throw insertError;
+          }
+
+          insertedRows += 1;
+        }
+      }
+
+      /* --------------------------------------------- */
+      /* Reset old pending rows no longer qualifying    */
+      /* --------------------------------------------- */
+
+      for (
+        const existing
+        of existingPayoutRows || []
+      ) {
+        if (
+          currentArtistIds.has(
+            existing.artist_id
+          )
+        ) {
+          continue;
+        }
+
+        if (
+          existing.status ===
+            "paid" ||
+          existing.status ===
+            "approved"
+        ) {
+          protectedRows += 1;
+          continue;
+        }
+
+        const {
+          error: zeroError,
+        } = await supabase
+          .from(
+            "premium_artist_payouts"
+          )
+          .update({
+            premium_streams: 0,
+            artist_share: 0,
+            currency:
+              payoutCurrency,
+            status: "pending",
+          })
+          .eq(
+            "id",
+            existing.id
+          );
+
+        if (zeroError) {
+          throw zeroError;
+        }
+
+        zeroedRows += 1;
+      }
+
+      const resultRows =
+        artistCalculations
+          .sort(
+            (a, b) =>
+              b.payoutCents -
+              a.payoutCents
+          )
+          .map(
+            (calculation) => ({
+              artist_id:
+                calculation.artistId,
+
+              premium_streams:
+                calculation.streams,
+
+              artist_share:
+                calculation.payoutCents /
+                100,
+
+              currency:
+                payoutCurrency,
+            })
+          );
+
+      console.log(
+        "✅ PREMIUM PAYOUT CALCULATION COMPLETE:",
+        {
+          month: selectedMonth,
+          year: selectedYear,
+          totalRevenue:
+            totalRevenueCents / 100,
+          artistPool:
+            artistPoolCents / 100,
+          qualifiedStreams:
+            qualifiedPremiumStreams,
+          artists:
+            resultRows.length,
+        }
+      );
+
+      return res.json({
+        success: true,
+
+        period: {
+          month:
+            selectedMonth,
+          year:
+            selectedYear,
+          start:
+            startIso,
+          end:
+            endIso,
+        },
+
+        currency:
+          payoutCurrency,
+
+        premium_revenue:
+          totalRevenueCents / 100,
+
+        tunevora_share:
+          platformShareCents / 100,
+
+        artist_pool:
+          artistPoolCents / 100,
+
+        qualified_premium_streams:
+          qualifiedPremiumStreams,
+
+        rejected_streams:
+          rejectedStreams,
+
+        artist_count:
+          resultRows.length,
+
+        database: {
+          inserted:
+            insertedRows,
+          updated:
+            updatedRows,
+          zeroed:
+            zeroedRows,
+          protected:
+            protectedRows,
+        },
+
+        payouts:
+          resultRows,
+      });
+    } catch (error) {
+      console.log(
+        "❌ PREMIUM PAYOUT ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Premium payout calculation failed",
+      });
+    }
+  }
+);
+
+
+
+/* ===================================================== */
 /* ❤️ HEALTH CHECK */
 /* ===================================================== */
 
