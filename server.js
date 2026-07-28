@@ -195,16 +195,20 @@ app.post(
         const {
           error: paymentError,
         } = await supabase
-          .from("payments")
-          .insert({
-            user_id: userId,
-            plan: selectedPlan,
-            amount: paidAmount,
-            currency: paidCurrency,
-            status: "completed",
-            stripe_payment_intent_id:
-              paymentIntentId,
-          });
+             .from("payments")
+             .insert({
+               user_id: userId,
+               plan: selectedPlan,
+               amount: paidAmount,
+               currency: paidCurrency,
+               status: "completed",
+
+             stripe_payment_intent_id: paymentIntentId,
+
+             payment_method: "Stripe",
+
+             transaction_reference: paymentIntentId,
+        });
 
         if (paymentError) {
           throw paymentError;
@@ -586,14 +590,18 @@ app.post(
       const {
         error: paymentError,
       } = await supabase
-        .from("payments")
-        .insert({
-          user_id,
-          plan: selectedPlan,
-          amount: paidAmount,
-          currency: paidCurrency,
-          status: "completed",
-        });
+           .from("payments")
+           .insert({
+             user_id,
+             plan: selectedPlan,
+             amount: paidAmount,
+             currency: paidCurrency,
+             status: "completed",
+ 
+            payment_method: "PayPal",
+
+            transaction_reference: orderID,
+       });
 
       if (paymentError) {
         console.log(
