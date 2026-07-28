@@ -291,14 +291,165 @@ app.post(
 app.use(bodyParser.json());
 
 /* ===================================================== */
-/* 🔑 GET PAYPAL TOKEN */
+/* 🔑 PAYPAL CONFIGURATION                              */
+/* ===================================================== */
+
+const PAYPAL_BASE_URL = String(
+  process.env.PAYPAL_BASE_URL ||
+    "https://api-m.sandbox.paypal.com"
+).replace(/\/+$/, "");
+
+const ALLOWED_SUBSCRIPTION_PLANS = [
+  "standard",
+  "premium",
+  "lossless",
+  "hires",
+];
+
+const SUBSCRIPTION_PRICE_COLUMNS = {
+  standard: "standard_price",
+  premium: "premium_price",
+  lossless: "price_lossless",
+  hires: "price_hires",
+};
+
+/* ===================================================== */
+/* 💵 LOAD TRUSTED SUBSCRIPTION PRICE                    */
+/* ===================================================== */
+
+async function loadSubscriptionPrice(
+  plan,
+  country
+) {
+  const normalizedPlan =
+    String(plan || "")
+      .trim()
+      .toLowerCase();
+
+  const normalizedCountry =
+    String(country || "US")
+      .trim()
+      .toUpperCase();
+
+  if (
+    !ALLOWED_SUBSCRIPTION_PLANS.includes(
+      normalizedPlan
+    )
+  ) {
+    throw new Error(
+      "Invalid subscription plan"
+    );
+  }
+
+  const priceColumn =
+    SUBSCRIPTION_PRICE_COLUMNS[
+      normalizedPlan
+    ];
+
+  let {
+    data: priceRow,
+    error: priceError,
+  } = await supabase
+    .from("subscription_prices")
+    .select(
+      `country, currency, ${priceColumn}`
+    )
+    .eq(
+      "country",
+      normalizedCountry
+    )
+    .maybeSingle();
+
+  if (priceError) {
+    throw priceError;
+  }
+
+  /*
+   * Use US pricing if the requested
+   * country does not have a configured row.
+   */
+  if (
+    !priceRow ||
+    priceRow[priceColumn] == null
+  ) {
+    const {
+      data: fallbackRow,
+      error: fallbackError,
+    } = await supabase
+      .from("subscription_prices")
+      .select(
+        `country, currency, ${priceColumn}`
+      )
+      .eq("country", "US")
+      .single();
+
+    if (fallbackError) {
+      throw fallbackError;
+    }
+
+    priceRow = fallbackRow;
+  }
+
+  const amount =
+    Number(priceRow[priceColumn]);
+
+  const currency =
+    String(priceRow.currency || "")
+      .trim()
+      .toUpperCase();
+
+  if (
+    !Number.isFinite(amount) ||
+    amount <= 0
+  ) {
+    throw new Error(
+      "Invalid subscription price"
+    );
+  }
+
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new Error(
+      "Invalid subscription currency"
+    );
+  }
+
+  return {
+    plan: normalizedPlan,
+
+    country:
+      String(
+        priceRow.country ||
+          normalizedCountry
+      ).toUpperCase(),
+
+    amount,
+
+    currency,
+  };
+}
+
+/* ===================================================== */
+/* 🔑 GET PAYPAL TOKEN                                   */
 /* ===================================================== */
 
 async function getAccessToken() {
   try {
+    const paypalSecret =
+      process.env.PAYPAL_SECRET ||
+      process.env.PAYPAL_CLIENT_SECRET;
+
+    if (
+      !process.env.PAYPAL_CLIENT_ID ||
+      !paypalSecret
+    ) {
+      throw new Error(
+        "PayPal credentials are missing"
+      );
+    }
+
     const response = await axios({
       url:
-        "https://api-m.sandbox.paypal.com/v1/oauth2/token",
+        `${PAYPAL_BASE_URL}/v1/oauth2/token`,
 
       method: "post",
 
@@ -307,7 +458,7 @@ async function getAccessToken() {
           process.env.PAYPAL_CLIENT_ID,
 
         password:
-          process.env.PAYPAL_SECRET,
+          paypalSecret,
       },
 
       headers: {
@@ -317,22 +468,26 @@ async function getAccessToken() {
 
       data:
         "grant_type=client_credentials",
+
+      timeout: 30000,
     });
 
     return response.data.access_token;
   } catch (error) {
     console.log(
-      "❌ TOKEN ERROR:",
-      error.response?.data ||
+      "❌ PAYPAL TOKEN ERROR:",
+      error.response?.data?.name ||
         error.message
     );
 
-    throw error;
+    throw new Error(
+      "Could not authenticate with PayPal"
+    );
   }
 }
 
 /* ===================================================== */
-/* 💳 CREATE PAYPAL ORDER */
+/* 💳 CREATE PAYPAL ORDER                                */
 /* ===================================================== */
 
 app.post(
@@ -346,63 +501,93 @@ app.post(
       const {
         user_id,
         plan,
-        amount,
-        currency,
-      } = req.body;
+        country,
+      } = req.body || {};
 
-      if (
-        !user_id ||
-        !plan ||
-        !amount ||
-        !currency
-      ) {
+      if (!user_id || !plan) {
         return res.status(400).json({
           error:
-            "Missing user_id, plan, amount, or currency",
+            "Missing user_id or plan",
         });
       }
 
-      const allowedPlans = [
-        "standard",
-        "premium",
-        "lossless",
-        "hires",
-      ];
+      const pricing =
+        await loadSubscriptionPrice(
+          plan,
+          country
+        );
 
-      if (!allowedPlans.includes(plan)) {
-        return res.status(400).json({
-          error: "Invalid plan",
+      const {
+        data: profile,
+        error: profileError,
+      } = await supabase
+        .from("profiles")
+        .select("id")
+        .eq("id", user_id)
+        .maybeSingle();
+
+      if (profileError) {
+        throw profileError;
+      }
+
+      if (!profile) {
+        return res.status(404).json({
+          error:
+            "User profile was not found",
         });
       }
 
       const accessToken =
         await getAccessToken();
 
+      const trustedMetadata = {
+        user_id,
+
+        plan:
+          pricing.plan,
+
+        country:
+          pricing.country,
+
+        amount:
+          pricing.amount.toFixed(2),
+
+        currency:
+          pricing.currency,
+      };
+
       const response = await axios.post(
-        "https://api-m.sandbox.paypal.com/v2/checkout/orders",
+        `${PAYPAL_BASE_URL}/v2/checkout/orders`,
         {
           intent: "CAPTURE",
 
           purchase_units: [
             {
-              custom_id: JSON.stringify({
-                user_id,
-                plan,
-                amount,
-                currency,
-              }),
+              custom_id:
+                JSON.stringify(
+                  trustedMetadata
+                ),
+
+              description:
+                `Tunevora ${pricing.plan} subscription - 30 days`,
 
               amount: {
                 currency_code:
-                  currency.toUpperCase(),
+                  pricing.currency,
 
                 value:
-                  Number(amount).toFixed(2),
+                  pricing.amount.toFixed(2),
               },
             },
           ],
 
           application_context: {
+            brand_name:
+              "Tunevora",
+
+            user_action:
+              "PAY_NOW",
+
             return_url:
               "tunevora://success",
 
@@ -417,32 +602,41 @@ app.post(
 
             "Content-Type":
               "application/json",
+
+            Prefer:
+              "return=representation",
           },
+
+          timeout: 30000,
         }
       );
 
-      return res.json(response.data);
+      return res.json({
+        ...response.data,
+
+        amount:
+          pricing.amount,
+
+        currency:
+          pricing.currency,
+      });
     } catch (error) {
       console.log(
         "❌ CREATE PAYPAL ERROR:",
-        error.response?.data ||
+        error.response?.data?.name ||
           error.message
       );
 
       return res.status(500).json({
         error:
           "Create order failed",
-
-        details:
-          error.response?.data ||
-          error.message,
       });
     }
   }
 );
 
 /* ===================================================== */
-/* 💳 CAPTURE PAYPAL ORDER */
+/* 💳 CAPTURE PAYPAL ORDER                               */
 /* ===================================================== */
 
 app.post(
@@ -456,7 +650,7 @@ app.post(
       const {
         orderID,
         user_id,
-      } = req.body;
+      } = req.body || {};
 
       if (!orderID || !user_id) {
         return res.status(400).json({
@@ -465,12 +659,74 @@ app.post(
         });
       }
 
+      /*
+       * Prevent processing the same
+       * PayPal order more than once.
+       */
+      const {
+        data: existingPayment,
+        error: existingPaymentError,
+      } = await supabase
+        .from("payments")
+        .select(`
+          id,
+          user_id,
+          plan,
+          amount,
+          currency,
+          status,
+          transaction_reference
+        `)
+        .eq(
+          "transaction_reference",
+          orderID
+        )
+        .maybeSingle();
+
+      if (existingPaymentError) {
+        throw existingPaymentError;
+      }
+
+      if (existingPayment) {
+        if (
+          existingPayment.user_id !==
+          user_id
+        ) {
+          return res.status(403).json({
+            error:
+              "This PayPal order belongs to another user",
+          });
+        }
+
+        return res.json({
+          success: true,
+
+          duplicate: true,
+
+          message:
+            `${existingPayment.plan} already activated`,
+
+          amount:
+            Number(
+              existingPayment.amount
+            ),
+
+          currency:
+            existingPayment.currency,
+
+          transaction_reference:
+            orderID,
+        });
+      }
+
       const accessToken =
         await getAccessToken();
 
       const capture =
         await axios.post(
-          `https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderID}/capture`,
+          `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+            orderID
+          )}/capture`,
           {},
           {
             headers: {
@@ -479,14 +735,14 @@ app.post(
 
               "Content-Type":
                 "application/json",
+
+              Prefer:
+                "return=representation",
             },
+
+            timeout: 30000,
           }
         );
-
-      console.log(
-        "💰 PAYPAL RESPONSE:",
-        capture.data
-      );
 
       if (
         capture.data.status !==
@@ -505,51 +761,131 @@ app.post(
         capture.data
           .purchase_units?.[0];
 
+      const captureDetails =
+        purchaseUnit
+          ?.payments
+          ?.captures?.[0];
+
       let paymentInfo = {};
 
       try {
         paymentInfo = JSON.parse(
-          purchaseUnit
-            ?.payments
-            ?.captures?.[0]
-            ?.custom_id ||
+          captureDetails?.custom_id ||
             purchaseUnit?.custom_id ||
             "{}"
         );
-      } catch (error) {
+      } catch (_) {
         paymentInfo = {};
       }
 
+      const metadataUserId =
+        String(
+          paymentInfo.user_id || ""
+        ).trim();
+
       const selectedPlan =
-        paymentInfo.plan ||
-        "premium";
+        String(
+          paymentInfo.plan || ""
+        )
+          .trim()
+          .toLowerCase();
 
-      const paidAmount =
-        Number(
-          paymentInfo.amount || 0
-        );
-
-      const paidCurrency =
-        (
-          paymentInfo.currency ||
-          "USD"
-        ).toUpperCase();
-
-      const allowedPlans = [
-        "standard",
-        "premium",
-        "lossless",
-        "hires",
-      ];
+      const metadataCountry =
+        String(
+          paymentInfo.country || "US"
+        )
+          .trim()
+          .toUpperCase();
 
       if (
-        !allowedPlans.includes(
+        metadataUserId !== user_id
+      ) {
+        return res.status(403).json({
+          error:
+            "PayPal order ownership verification failed",
+        });
+      }
+
+      if (
+        !ALLOWED_SUBSCRIPTION_PLANS.includes(
           selectedPlan
         )
       ) {
         return res.status(400).json({
           error:
             "Invalid PayPal plan",
+        });
+      }
+
+      const expectedPricing =
+        await loadSubscriptionPrice(
+          selectedPlan,
+          metadataCountry
+        );
+
+      const capturedAmount =
+        Number(
+          captureDetails
+            ?.amount
+            ?.value
+        );
+
+      const capturedCurrency =
+        String(
+          captureDetails
+            ?.amount
+            ?.currency_code ||
+            ""
+        )
+          .trim()
+          .toUpperCase();
+
+      if (
+        !Number.isFinite(
+          capturedAmount
+        ) ||
+        capturedAmount <= 0
+      ) {
+        return res.status(400).json({
+          error:
+            "Invalid captured PayPal amount",
+        });
+      }
+
+      const amountMatches =
+        Math.abs(
+          capturedAmount -
+            expectedPricing.amount
+        ) < 0.001;
+
+      const currencyMatches =
+        capturedCurrency ===
+        expectedPricing.currency;
+
+      if (
+        !amountMatches ||
+        !currencyMatches
+      ) {
+        console.log(
+          "❌ PAYPAL PRICE VERIFICATION FAILED:",
+          {
+            orderID,
+
+            expectedAmount:
+              expectedPricing.amount,
+
+            capturedAmount,
+
+            expectedCurrency:
+              expectedPricing.currency,
+
+            capturedCurrency,
+          }
+        );
+
+        return res.status(400).json({
+          error:
+            "PayPal payment amount or currency did not match the subscription price",
         });
       }
 
@@ -564,55 +900,74 @@ app.post(
         );
 
       const {
-        error: userError,
+        error: profileUpdateError,
       } = await supabase
         .from("profiles")
         .update({
           is_premium: true,
-          plan: selectedPlan,
+
+          plan:
+            expectedPricing.plan,
+
           premium_until:
             premiumUntil.toISOString(),
         })
         .eq("id", user_id);
 
-      if (userError) {
-        console.log(
-          "❌ USER UPDATE ERROR:",
-          userError
-        );
-
-        return res.status(500).json({
-          error:
-            userError.message,
-        });
+      if (profileUpdateError) {
+        throw profileUpdateError;
       }
 
       const {
         error: paymentError,
       } = await supabase
-           .from("payments")
-           .insert({
-             user_id,
-             plan: selectedPlan,
-             amount: paidAmount,
-             currency: paidCurrency,
-             status: "completed",
- 
-            payment_method: "PayPal",
+        .from("payments")
+        .insert({
+          user_id,
 
-            transaction_reference: orderID,
-       });
+          plan:
+            expectedPricing.plan,
+
+          amount:
+            capturedAmount,
+
+          currency:
+            capturedCurrency,
+
+          status:
+            "completed",
+
+          payment_method:
+            "PayPal",
+
+          transaction_reference:
+            orderID,
+        });
 
       if (paymentError) {
-        console.log(
-          "❌ PAYMENT INSERT ERROR:",
-          paymentError
-        );
+        if (
+          paymentError.code === "23505"
+        ) {
+          return res.json({
+            success: true,
 
-        return res.status(500).json({
-          error:
-            paymentError.message,
-        });
+            duplicate: true,
+
+            message:
+              `${expectedPricing.plan} already activated`,
+
+            amount:
+              capturedAmount,
+
+            currency:
+              capturedCurrency,
+
+            transaction_reference:
+              orderID,
+          });
+        }
+
+        throw paymentError;
       }
 
       const {
@@ -621,24 +976,25 @@ app.post(
         .from("subscriptions")
         .insert({
           user_id,
-          plan: selectedPlan,
-          status: "active",
-          amount: paidAmount,
-          currency: paidCurrency,
+
+          plan:
+            expectedPricing.plan,
+
+          status:
+            "active",
+
+          amount:
+            capturedAmount,
+
+          currency:
+            capturedCurrency,
+
           expires_at:
             premiumUntil.toISOString(),
         });
 
       if (subscriptionError) {
-        console.log(
-          "❌ SUBSCRIPTION INSERT ERROR:",
-          subscriptionError
-        );
-
-        return res.status(500).json({
-          error:
-            subscriptionError.message,
-        });
+        throw subscriptionError;
       }
 
       const {
@@ -646,47 +1002,59 @@ app.post(
       } = await supabase
         .from("admin_revenue")
         .insert({
-          source: selectedPlan,
-          amount: paidAmount,
-          currency: paidCurrency,
+          source:
+            expectedPricing.plan,
+
+          amount:
+            capturedAmount,
+
+          currency:
+            capturedCurrency,
         });
 
       if (revenueError) {
-        console.log(
-          "❌ REVENUE INSERT ERROR:",
-          revenueError
-        );
-
-        return res.status(500).json({
-          error:
-            revenueError.message,
-        });
+        throw revenueError;
       }
+
+      console.log(
+        `✅ PAYPAL ACTIVATED: ${user_id} → ${expectedPricing.plan}`
+      );
 
       return res.json({
         success: true,
+
         message:
-          `${selectedPlan} activated`,
+          `${expectedPricing.plan} activated`,
+
+        amount:
+          capturedAmount,
+
+        currency:
+          capturedCurrency,
+
+        transaction_reference:
+          orderID,
+
+        premium_until:
+          premiumUntil.toISOString(),
       });
     } catch (error) {
+      const paypalIssue =
+        error.response?.data;
+
       console.log(
         "❌ CAPTURE PAYPAL ERROR:",
-        error.response?.data ||
+        paypalIssue?.name ||
           error.message
       );
 
       return res.status(500).json({
         error:
           "Capture failed",
-
-        details:
-          error.response?.data ||
-          error.message,
       });
     }
   }
 );
-
 /* ===================================================== */
 /* 💳 CREATE STRIPE PAYMENT INTENT */
 /* ===================================================== */
