@@ -20,6 +20,770 @@ const supabase = createClient(
 );
 
 /* ===================================================== */
+/* 🧩 UNIFIED PAYMENT HELPERS                            */
+/* ===================================================== */
+
+const PAYMENT_TYPES = {
+  SUBSCRIPTION: "subscription",
+  EVENT_TICKET: "event_ticket",
+  ADVERTISEMENT: "advertisement",
+};
+
+const ZERO_DECIMAL_CURRENCIES = new Set([
+  "BIF",
+  "CLP",
+  "DJF",
+  "GNF",
+  "JPY",
+  "KMF",
+  "KRW",
+  "MGA",
+  "PYG",
+  "RWF",
+  "UGX",
+  "VND",
+  "VUV",
+  "XAF",
+  "XOF",
+  "XPF",
+]);
+
+function normalizeCurrency(value, fallback = "USD") {
+  const currency = String(value || fallback)
+    .trim()
+    .toUpperCase();
+
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new Error("Invalid payment currency");
+  }
+
+  return currency;
+}
+
+function amountToSmallestUnit(amount, currency) {
+  const numericAmount = Number(amount);
+  const normalizedCurrency = normalizeCurrency(currency);
+
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    throw new Error("Invalid payment amount");
+  }
+
+  const multiplier = ZERO_DECIMAL_CURRENCIES.has(
+    normalizedCurrency
+  )
+    ? 1
+    : 100;
+
+  const smallestUnit = Math.round(
+    numericAmount * multiplier
+  );
+
+  if (!Number.isInteger(smallestUnit) || smallestUnit <= 0) {
+    throw new Error("Invalid smallest-unit payment amount");
+  }
+
+  return smallestUnit;
+}
+
+function smallestUnitToAmount(amount, currency) {
+  const normalizedCurrency = normalizeCurrency(currency);
+  const multiplier = ZERO_DECIMAL_CURRENCIES.has(
+    normalizedCurrency
+  )
+    ? 1
+    : 100;
+
+  return Number(amount || 0) / multiplier;
+}
+
+function amountsMatch(first, second) {
+  return Math.abs(Number(first) - Number(second)) < 0.001;
+}
+
+function paymentPublicBaseUrl(req) {
+  const configured = String(
+    process.env.PAYMENT_PUBLIC_BASE_URL || ""
+  )
+    .trim()
+    .replace(/\/+$/, "");
+
+  if (configured) {
+    return configured;
+  }
+
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+function checkoutUrls(req) {
+  const baseUrl = paymentPublicBaseUrl(req);
+
+  return {
+    successUrl:
+      `${baseUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+
+    cancelUrl:
+      `${baseUrl}/payment-cancel`,
+  };
+}
+
+async function loadProfile(userId) {
+  const {
+    data: profile,
+    error,
+  } = await supabase
+    .from("profiles")
+    .select("id")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  if (!profile) {
+    throw new Error("User profile was not found");
+  }
+
+  return profile;
+}
+
+async function findPaymentByReference(reference) {
+  const {
+    data,
+    error,
+  } = await supabase
+    .from("payments")
+    .select(`
+      id,
+      user_id,
+      plan,
+      amount,
+      currency,
+      status,
+      transaction_reference
+    `)
+    .eq("transaction_reference", reference)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data;
+}
+
+/*
+ * Ticket and advertisement rows pre-date the unified
+ * payment history model. Recording them in payments is
+ * therefore best-effort so a history-table mismatch never
+ * prevents an already-verified purchase from being completed.
+ */
+async function recordCommercePayment({
+  userId,
+  purchaseType,
+  amount,
+  currency,
+  method,
+  reference,
+  stripePaymentIntentId,
+}) {
+  const row = {
+    user_id: userId,
+    plan: purchaseType,
+    amount: Number(amount),
+    currency: normalizeCurrency(currency),
+    status: "completed",
+    payment_method: method,
+    transaction_reference: reference,
+  };
+
+  if (stripePaymentIntentId) {
+    row.stripe_payment_intent_id =
+      stripePaymentIntentId;
+  }
+
+  const {
+    error,
+  } = await supabase
+    .from("payments")
+    .insert(row);
+
+  if (error && error.code !== "23505") {
+    console.log(
+      "⚠️ COMMERCE PAYMENT HISTORY WARNING:",
+      error.message
+    );
+  }
+}
+
+async function recordAdminRevenue({
+  source,
+  amount,
+  currency,
+}) {
+  const numericAmount = Number(amount);
+
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    return;
+  }
+
+  const {
+    error,
+  } = await supabase
+    .from("admin_revenue")
+    .insert({
+      source,
+      amount: numericAmount,
+      currency: normalizeCurrency(currency),
+    });
+
+  if (error) {
+    throw error;
+  }
+}
+
+async function finalizeStripeSubscription(paymentIntent) {
+  const paymentIntentId = paymentIntent.id;
+  const userId = paymentIntent.metadata?.user_id;
+  const selectedPlan = String(
+    paymentIntent.metadata?.plan || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  if (
+    !userId ||
+    !ALLOWED_SUBSCRIPTION_PLANS.includes(selectedPlan)
+  ) {
+    throw new Error("Invalid Stripe subscription metadata");
+  }
+
+  const {
+    data: existingPayment,
+    error: existingPaymentError,
+  } = await supabase
+    .from("payments")
+    .select("id")
+    .eq(
+      "stripe_payment_intent_id",
+      paymentIntentId
+    )
+    .maybeSingle();
+
+  if (existingPaymentError) {
+    throw existingPaymentError;
+  }
+
+  if (existingPayment) {
+    return {
+      duplicate: true,
+      paymentType: PAYMENT_TYPES.SUBSCRIPTION,
+    };
+  }
+
+  const paidCurrency = normalizeCurrency(
+    paymentIntent.currency
+  );
+
+  const paidAmount = smallestUnitToAmount(
+    paymentIntent.amount_received,
+    paidCurrency
+  );
+
+  const premiumUntil = new Date(
+    Date.now() + 30 * 24 * 60 * 60 * 1000
+  );
+
+  const {
+    error: profileError,
+  } = await supabase
+    .from("profiles")
+    .update({
+      is_premium: true,
+      plan: selectedPlan,
+      premium_until: premiumUntil.toISOString(),
+    })
+    .eq("id", userId);
+
+  if (profileError) {
+    throw profileError;
+  }
+
+  const {
+    error: paymentError,
+  } = await supabase
+    .from("payments")
+    .insert({
+      user_id: userId,
+      plan: selectedPlan,
+      amount: paidAmount,
+      currency: paidCurrency,
+      status: "completed",
+      stripe_payment_intent_id: paymentIntentId,
+      payment_method: "Stripe",
+      transaction_reference: paymentIntentId,
+    });
+
+  if (paymentError) {
+    throw paymentError;
+  }
+
+  const {
+    error: subscriptionError,
+  } = await supabase
+    .from("subscriptions")
+    .insert({
+      user_id: userId,
+      plan: selectedPlan,
+      status: "active",
+      amount: paidAmount,
+      currency: paidCurrency,
+      expires_at: premiumUntil.toISOString(),
+    });
+
+  if (subscriptionError) {
+    throw subscriptionError;
+  }
+
+  await recordAdminRevenue({
+    source: selectedPlan,
+    amount: paidAmount,
+    currency: paidCurrency,
+  });
+
+  console.log(
+    `✅ STRIPE SUBSCRIPTION ACTIVATED: ${userId} → ${selectedPlan}`
+  );
+
+  return {
+    duplicate: false,
+    paymentType: PAYMENT_TYPES.SUBSCRIPTION,
+  };
+}
+
+async function loadTicketForPayment(ticketId) {
+  const {
+    data: ticket,
+    error,
+  } = await supabase
+    .from("event_tickets")
+    .select(`
+      id,
+      user_id,
+      artist_id,
+      event_title,
+      venue,
+      ticket_price,
+      platform_fee,
+      currency,
+      payment_status,
+      status,
+      is_used
+    `)
+    .eq("id", ticketId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  if (!ticket) {
+    throw new Error("Event ticket was not found");
+  }
+
+  return ticket;
+}
+
+function ticketPricing(ticket) {
+  const ticketPrice = Number(ticket.ticket_price || 0);
+  const platformFee = Number(ticket.platform_fee || 0);
+  const total = ticketPrice + platformFee;
+  const currency = normalizeCurrency(
+    ticket.currency || "USD"
+  );
+
+  if (
+    !Number.isFinite(ticketPrice) ||
+    ticketPrice < 0 ||
+    !Number.isFinite(platformFee) ||
+    platformFee < 0 ||
+    !Number.isFinite(total) ||
+    total <= 0
+  ) {
+    throw new Error("Event ticket price is invalid");
+  }
+
+  return {
+    ticketPrice,
+    platformFee,
+    total,
+    currency,
+  };
+}
+
+async function finalizeStripeTicket(paymentIntent) {
+  const userId = String(
+    paymentIntent.metadata?.user_id || ""
+  ).trim();
+
+  const ticketId = String(
+    paymentIntent.metadata?.reference_id ||
+      paymentIntent.metadata?.ticket_id ||
+      ""
+  ).trim();
+
+  if (!userId || !ticketId) {
+    throw new Error("Invalid Stripe ticket metadata");
+  }
+
+  const ticket = await loadTicketForPayment(ticketId);
+
+  if (String(ticket.user_id) !== userId) {
+    throw new Error(
+      "Stripe ticket ownership verification failed"
+    );
+  }
+
+  if (
+    String(ticket.payment_status || "")
+      .toLowerCase() === "paid"
+  ) {
+    return {
+      duplicate: true,
+      paymentType: PAYMENT_TYPES.EVENT_TICKET,
+    };
+  }
+
+  const pricing = ticketPricing(ticket);
+  const paidCurrency = normalizeCurrency(
+    paymentIntent.currency
+  );
+  const paidAmount = smallestUnitToAmount(
+    paymentIntent.amount_received,
+    paidCurrency
+  );
+
+  if (
+    paidCurrency !== pricing.currency ||
+    !amountsMatch(paidAmount, pricing.total)
+  ) {
+    throw new Error(
+      "Stripe ticket amount or currency verification failed"
+    );
+  }
+
+  const {
+    error: updateError,
+  } = await supabase
+    .from("event_tickets")
+    .update({
+      payment_status: "paid",
+      status: "valid",
+    })
+    .eq("id", ticketId)
+    .eq("user_id", userId);
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  await recordCommercePayment({
+    userId,
+    purchaseType: PAYMENT_TYPES.EVENT_TICKET,
+    amount: paidAmount,
+    currency: paidCurrency,
+    method: "Stripe",
+    reference: paymentIntent.id,
+    stripePaymentIntentId: paymentIntent.id,
+  });
+
+  await recordAdminRevenue({
+    source: "ticket_platform_fee",
+    amount: pricing.platformFee,
+    currency: paidCurrency,
+  });
+
+  console.log(
+    `✅ STRIPE TICKET PAID: ${ticketId}`
+  );
+
+  return {
+    duplicate: false,
+    paymentType: PAYMENT_TYPES.EVENT_TICKET,
+  };
+}
+
+async function loadCampaignForPayment(campaignId) {
+  const {
+    data: campaign,
+    error,
+  } = await supabase
+    .from("ad_campaigns")
+    .select(`
+      id,
+      ad_id,
+      budget,
+      currency,
+      created_by,
+      payment_status,
+      payment_id,
+      status
+    `)
+    .eq("id", campaignId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  if (!campaign) {
+    throw new Error("Advertisement campaign was not found");
+  }
+
+  return campaign;
+}
+
+function campaignPricing(campaign) {
+  const amount = Number(campaign.budget);
+  const currency = normalizeCurrency(
+    campaign.currency || "USD"
+  );
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error("Campaign budget is invalid");
+  }
+
+  return {
+    amount,
+    currency,
+  };
+}
+
+async function finalizeStripeAdvertisement(paymentIntent) {
+  const userId = String(
+    paymentIntent.metadata?.user_id || ""
+  ).trim();
+
+  const campaignId = String(
+    paymentIntent.metadata?.reference_id ||
+      paymentIntent.metadata?.campaign_id ||
+      ""
+  ).trim();
+
+  if (!userId || !campaignId) {
+    throw new Error(
+      "Invalid Stripe advertisement metadata"
+    );
+  }
+
+  const campaign =
+    await loadCampaignForPayment(campaignId);
+
+  if (String(campaign.created_by) !== userId) {
+    throw new Error(
+      "Stripe campaign ownership verification failed"
+    );
+  }
+
+  if (
+    String(campaign.payment_status || "")
+      .toLowerCase() === "paid"
+  ) {
+    return {
+      duplicate: true,
+      paymentType: PAYMENT_TYPES.ADVERTISEMENT,
+    };
+  }
+
+  const pricing = campaignPricing(campaign);
+  const paidCurrency = normalizeCurrency(
+    paymentIntent.currency
+  );
+  const paidAmount = smallestUnitToAmount(
+    paymentIntent.amount_received,
+    paidCurrency
+  );
+
+  if (
+    paidCurrency !== pricing.currency ||
+    !amountsMatch(paidAmount, pricing.amount)
+  ) {
+    throw new Error(
+      "Stripe advertisement amount or currency verification failed"
+    );
+  }
+
+  const {
+    error: updateError,
+  } = await supabase
+    .from("ad_campaigns")
+    .update({
+      payment_status: "paid",
+      payment_id: paymentIntent.id,
+    })
+    .eq("id", campaignId)
+    .eq("created_by", userId);
+
+  if (updateError) {
+    throw updateError;
+  }
+
+  await recordCommercePayment({
+    userId,
+    purchaseType: PAYMENT_TYPES.ADVERTISEMENT,
+    amount: paidAmount,
+    currency: paidCurrency,
+    method: "Stripe",
+    reference: paymentIntent.id,
+    stripePaymentIntentId: paymentIntent.id,
+  });
+
+  await recordAdminRevenue({
+    source: "advertisement",
+    amount: paidAmount,
+    currency: paidCurrency,
+  });
+
+  console.log(
+    `✅ STRIPE AD CAMPAIGN PAID: ${campaignId}`
+  );
+
+  return {
+    duplicate: false,
+    paymentType: PAYMENT_TYPES.ADVERTISEMENT,
+  };
+}
+
+async function finalizeStripePayment(paymentIntent) {
+  const paymentType = String(
+    paymentIntent.metadata?.payment_type ||
+      PAYMENT_TYPES.SUBSCRIPTION
+  )
+    .trim()
+    .toLowerCase();
+
+  if (paymentType === PAYMENT_TYPES.SUBSCRIPTION) {
+    return finalizeStripeSubscription(paymentIntent);
+  }
+
+  if (paymentType === PAYMENT_TYPES.EVENT_TICKET) {
+    return finalizeStripeTicket(paymentIntent);
+  }
+
+  if (paymentType === PAYMENT_TYPES.ADVERTISEMENT) {
+    return finalizeStripeAdvertisement(paymentIntent);
+  }
+
+  throw new Error(
+    `Unsupported Stripe payment type: ${paymentType}`
+  );
+}
+
+async function createPayPalOrder({
+  description,
+  amount,
+  currency,
+  metadata,
+  returnUrl,
+  cancelUrl,
+}) {
+  const accessToken = await getAccessToken();
+  const normalizedCurrency =
+    normalizeCurrency(currency);
+  const numericAmount = Number(amount);
+
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+    throw new Error("Invalid PayPal order amount");
+  }
+
+  const response = await axios.post(
+    `${PAYPAL_BASE_URL}/v2/checkout/orders`,
+    {
+      intent: "CAPTURE",
+      purchase_units: [
+        {
+          custom_id: JSON.stringify(metadata),
+          description,
+          amount: {
+            currency_code: normalizedCurrency,
+            value: numericAmount.toFixed(2),
+          },
+        },
+      ],
+      application_context: {
+        brand_name: "Tunevora",
+        user_action: "PAY_NOW",
+        return_url: returnUrl,
+        cancel_url: cancelUrl,
+      },
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      timeout: 30000,
+    }
+  );
+
+  return response.data;
+}
+
+async function capturePayPalOrder(orderId) {
+  const accessToken = await getAccessToken();
+
+  return axios.post(
+    `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+      orderId
+    )}/capture`,
+    {},
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Prefer: "return=representation",
+      },
+      timeout: 30000,
+    }
+  );
+}
+
+function paypalCaptureData(captureResponse) {
+  const purchaseUnit =
+    captureResponse.data.purchase_units?.[0];
+
+  const captureDetails =
+    purchaseUnit?.payments?.captures?.[0];
+
+  let metadata = {};
+
+  try {
+    metadata = JSON.parse(
+      captureDetails?.custom_id ||
+        purchaseUnit?.custom_id ||
+        "{}"
+    );
+  } catch (_) {
+    metadata = {};
+  }
+
+  return {
+    status: captureResponse.data.status,
+    purchaseUnit,
+    captureDetails,
+    metadata,
+    amount: Number(
+      captureDetails?.amount?.value
+    ),
+    currency: normalizeCurrency(
+      captureDetails?.amount?.currency_code ||
+        "USD"
+    ),
+  };
+}
+
+/* ===================================================== */
 /* 🔍 DEBUG */
 /* ===================================================== */
 
@@ -54,6 +818,7 @@ console.log(
   "STRIPE WEBHOOK SECRET EXISTS:",
   !!process.env.STRIPE_WEBHOOK_SECRET
 );
+
 
 /* ===================================================== */
 /* 🔔 STRIPE WEBHOOK                                     */
@@ -98,161 +863,15 @@ app.post(
         event.type ===
         "payment_intent.succeeded"
       ) {
-        const paymentIntent =
-          event.data.object;
-
-        const paymentIntentId =
-          paymentIntent.id;
-
-        const userId =
-          paymentIntent.metadata?.user_id;
-
-        const selectedPlan =
-          paymentIntent.metadata?.plan;
-
-        const allowedPlans = [
-          "standard",
-          "premium",
-          "lossless",
-          "hires",
-        ];
-
-        if (
-          !userId ||
-          !allowedPlans.includes(selectedPlan)
-        ) {
-          throw new Error(
-            "Invalid Stripe payment metadata"
-          );
-        }
-
-        /*
-         * Stripe can send the same webhook
-         * more than once.
-         */
-        const {
-          data: existingPayment,
-          error: existingPaymentError,
-        } = await supabase
-          .from("payments")
-          .select("id")
-          .eq(
-            "stripe_payment_intent_id",
-            paymentIntentId
-          )
-          .maybeSingle();
-
-        if (existingPaymentError) {
-          throw existingPaymentError;
-        }
-
-        if (existingPayment) {
-          console.log(
-            "⚠️ STRIPE PAYMENT ALREADY PROCESSED:",
-            paymentIntentId
+        const result =
+          await finalizeStripePayment(
+            event.data.object
           );
 
-          return res.json({
-            received: true,
-            duplicate: true,
-          });
-        }
-
-        const paidAmount =
-          Number(
-            paymentIntent.amount_received
-          ) / 100;
-
-        const paidCurrency =
-          paymentIntent.currency
-            .toUpperCase();
-
-        const premiumUntil = new Date(
-          Date.now() +
-            30 * 24 * 60 * 60 * 1000
-        );
-
-        /* Update user plan */
-
-        const {
-          error: profileError,
-        } = await supabase
-          .from("profiles")
-          .update({
-            is_premium: true,
-            plan: selectedPlan,
-            premium_until:
-              premiumUntil.toISOString(),
-          })
-          .eq("id", userId);
-
-        if (profileError) {
-          throw profileError;
-        }
-
-        /* Record payment */
-
-        const {
-          error: paymentError,
-        } = await supabase
-             .from("payments")
-             .insert({
-               user_id: userId,
-               plan: selectedPlan,
-               amount: paidAmount,
-               currency: paidCurrency,
-               status: "completed",
-
-             stripe_payment_intent_id: paymentIntentId,
-
-             payment_method: "Stripe",
-
-             transaction_reference: paymentIntentId,
+        return res.json({
+          received: true,
+          ...result,
         });
-
-        if (paymentError) {
-          throw paymentError;
-        }
-
-        /* Record subscription */
-
-        const {
-          error: subscriptionError,
-        } = await supabase
-          .from("subscriptions")
-          .insert({
-            user_id: userId,
-            plan: selectedPlan,
-            status: "active",
-            amount: paidAmount,
-            currency: paidCurrency,
-            expires_at:
-              premiumUntil.toISOString(),
-          });
-
-        if (subscriptionError) {
-          throw subscriptionError;
-        }
-
-        /* Record admin revenue */
-
-        const {
-          error: revenueError,
-        } = await supabase
-          .from("admin_revenue")
-          .insert({
-            source: selectedPlan,
-            amount: paidAmount,
-            currency: paidCurrency,
-          });
-
-        if (revenueError) {
-          throw revenueError;
-        }
-
-        console.log(
-          `✅ STRIPE ACTIVATED: ${userId} → ${selectedPlan}`
-        );
       }
 
       if (
@@ -264,7 +883,12 @@ app.post(
 
         console.log(
           "❌ STRIPE PAYMENT FAILED:",
-          paymentIntent.id
+          {
+            id: paymentIntent.id,
+            payment_type:
+              paymentIntent.metadata?.payment_type ||
+              PAYMENT_TYPES.SUBSCRIPTION,
+          }
         );
       }
 
@@ -289,6 +913,7 @@ app.post(
  * the Stripe webhook.
  */
 app.use(bodyParser.json());
+
 
 /* ===================================================== */
 /* 🔑 PAYPAL CONFIGURATION                              */
@@ -1055,6 +1680,405 @@ app.post(
     }
   }
 );
+
+/* ===================================================== */
+/* 🌐 HOSTED PAYMENT RETURN PAGES                       */
+/* ===================================================== */
+
+app.get(
+  "/payment-success",
+  (req, res) => {
+    const sessionId = String(
+      req.query.session_id || ""
+    );
+
+    res
+      .status(200)
+      .type("html")
+      .send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tunevora Payment Complete</title>
+  <style>
+    body{margin:0;background:#08080a;color:#fff;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh}
+    main{max-width:520px;margin:24px;padding:36px;border:1px solid #ffffff1a;border-radius:28px;background:linear-gradient(145deg,#34113d,#141419);text-align:center}
+    .icon{font-size:54px}.muted{color:#ffffff99;line-height:1.6}.ref{color:#ffffff66;font-size:12px;word-break:break-all}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="icon">✓</div>
+    <h1>Payment completed</h1>
+    <p class="muted">Your payment was received. Tunevora is confirming the purchase securely. You may return to the app.</p>
+    <p class="ref">${sessionId}</p>
+  </main>
+  <script>
+    setTimeout(function () {
+      window.location.href =
+        "tunevora://success?session_id=" +
+        encodeURIComponent(${JSON.stringify(sessionId)});
+    }, 700);
+  </script>
+</body>
+</html>`);
+  }
+);
+
+app.get(
+  "/payment-cancel",
+  (req, res) => {
+    res
+      .status(200)
+      .type("html")
+      .send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tunevora Payment Cancelled</title>
+  <style>
+    body{margin:0;background:#08080a;color:#fff;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh}
+    main{max-width:520px;margin:24px;padding:36px;border:1px solid #ffffff1a;border-radius:28px;background:#17171c;text-align:center}
+    .muted{color:#ffffff99;line-height:1.6}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Payment cancelled</h1>
+    <p class="muted">No charge was completed. You may close this page and return to Tunevora.</p>
+  </main>
+  <script>
+    setTimeout(function () {
+      window.location.href = "tunevora://cancel";
+    }, 700);
+  </script>
+</body>
+</html>`);
+  }
+);
+
+/* ===================================================== */
+/* 🌐 CREATE UNIFIED STRIPE CHECKOUT SESSION             */
+/* WEB + WINDOWS                                         */
+/* ===================================================== */
+
+app.post(
+  "/create-stripe-checkout-session",
+  async (req, res) => {
+    try {
+      const {
+        payment_type,
+        user_id,
+        plan,
+        country,
+        reference_id,
+      } = req.body || {};
+
+      const paymentType = String(
+        payment_type || PAYMENT_TYPES.SUBSCRIPTION
+      )
+        .trim()
+        .toLowerCase();
+
+      if (!user_id) {
+        return res.status(400).json({
+          error: "Missing user_id",
+        });
+      }
+
+      await loadProfile(user_id);
+
+      let amount;
+      let currency;
+      let description;
+      let metadata;
+
+      if (
+        paymentType ===
+        PAYMENT_TYPES.SUBSCRIPTION
+      ) {
+        const pricing =
+          await loadSubscriptionPrice(
+            plan,
+            country
+          );
+
+        amount = pricing.amount;
+        currency = pricing.currency;
+        description =
+          `Tunevora ${pricing.plan} subscription - 30 days`;
+
+        metadata = {
+          payment_type:
+            PAYMENT_TYPES.SUBSCRIPTION,
+          user_id,
+          plan: pricing.plan,
+          country: pricing.country,
+        };
+      } else if (
+        paymentType ===
+        PAYMENT_TYPES.EVENT_TICKET
+      ) {
+        if (!reference_id) {
+          return res.status(400).json({
+            error: "Missing ticket reference_id",
+          });
+        }
+
+        const ticket =
+          await loadTicketForPayment(
+            reference_id
+          );
+
+        if (
+          String(ticket.user_id) !==
+          String(user_id)
+        ) {
+          return res.status(403).json({
+            error:
+              "This ticket belongs to another user",
+          });
+        }
+
+        if (
+          String(ticket.payment_status || "")
+            .toLowerCase() === "paid"
+        ) {
+          return res.status(409).json({
+            error:
+              "This ticket has already been paid",
+          });
+        }
+
+        const pricing =
+          ticketPricing(ticket);
+
+        amount = pricing.total;
+        currency = pricing.currency;
+        description =
+          `Tunevora ticket - ${ticket.event_title || "Event"}`;
+
+        metadata = {
+          payment_type:
+            PAYMENT_TYPES.EVENT_TICKET,
+          user_id,
+          reference_id:
+            String(ticket.id),
+          ticket_id:
+            String(ticket.id),
+        };
+      } else if (
+        paymentType ===
+        PAYMENT_TYPES.ADVERTISEMENT
+      ) {
+        if (!reference_id) {
+          return res.status(400).json({
+            error: "Missing campaign reference_id",
+          });
+        }
+
+        const campaign =
+          await loadCampaignForPayment(
+            reference_id
+          );
+
+        if (
+          String(campaign.created_by) !==
+          String(user_id)
+        ) {
+          return res.status(403).json({
+            error:
+              "This campaign belongs to another user",
+          });
+        }
+
+        if (
+          String(campaign.payment_status || "")
+            .toLowerCase() === "paid"
+        ) {
+          return res.status(409).json({
+            error:
+              "This campaign has already been paid",
+          });
+        }
+
+        const pricing =
+          campaignPricing(campaign);
+
+        amount = pricing.amount;
+        currency = pricing.currency;
+        description =
+          "Tunevora advertisement campaign";
+
+        metadata = {
+          payment_type:
+            PAYMENT_TYPES.ADVERTISEMENT,
+          user_id,
+          reference_id:
+            String(campaign.id),
+          campaign_id:
+            String(campaign.id),
+          ad_id:
+            String(campaign.ad_id || ""),
+        };
+      } else {
+        return res.status(400).json({
+          error: "Unsupported payment_type",
+        });
+      }
+
+      const {
+        successUrl,
+        cancelUrl,
+      } = checkoutUrls(req);
+
+      const session =
+        await stripe.checkout.sessions.create({
+          mode: "payment",
+          line_items: [
+            {
+              price_data: {
+                currency:
+                  currency.toLowerCase(),
+                product_data: {
+                  name: description,
+                },
+                unit_amount:
+                  amountToSmallestUnit(
+                    amount,
+                    currency
+                  ),
+              },
+              quantity: 1,
+            },
+          ],
+          success_url: successUrl,
+          cancel_url: cancelUrl,
+          client_reference_id:
+            String(user_id),
+          metadata,
+          payment_intent_data: {
+            metadata,
+          },
+        });
+
+      return res.json({
+        success: true,
+        sessionId: session.id,
+        checkoutUrl: session.url,
+        payment_type: paymentType,
+        amount,
+        currency,
+      });
+    } catch (error) {
+      console.log(
+        "❌ CREATE STRIPE CHECKOUT ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Could not create Stripe Checkout session",
+      });
+    }
+  }
+);
+
+/* ===================================================== */
+/* 🎫 CREATE STRIPE TICKET PAYMENT INTENT                */
+/* MOBILE                                                */
+/* ===================================================== */
+
+app.post(
+  "/create-ticket-payment-intent",
+  async (req, res) => {
+    try {
+      const {
+        user_id,
+        ticket_id,
+      } = req.body || {};
+
+      if (!user_id || !ticket_id) {
+        return res.status(400).json({
+          error:
+            "Missing user_id or ticket_id",
+        });
+      }
+
+      const ticket =
+        await loadTicketForPayment(ticket_id);
+
+      if (
+        String(ticket.user_id) !==
+        String(user_id)
+      ) {
+        return res.status(403).json({
+          error:
+            "This ticket belongs to another user",
+        });
+      }
+
+      if (
+        String(ticket.payment_status || "")
+          .toLowerCase() === "paid"
+      ) {
+        return res.status(409).json({
+          error:
+            "This ticket has already been paid",
+        });
+      }
+
+      const pricing =
+        ticketPricing(ticket);
+
+      const paymentIntent =
+        await stripe.paymentIntents.create({
+          amount: amountToSmallestUnit(
+            pricing.total,
+            pricing.currency
+          ),
+          currency:
+            pricing.currency.toLowerCase(),
+          automatic_payment_methods: {
+            enabled: true,
+          },
+          metadata: {
+            payment_type:
+              PAYMENT_TYPES.EVENT_TICKET,
+            user_id,
+            reference_id:
+              String(ticket.id),
+            ticket_id:
+              String(ticket.id),
+          },
+        });
+
+      return res.json({
+        clientSecret:
+          paymentIntent.client_secret,
+        paymentIntentId:
+          paymentIntent.id,
+        amount: pricing.total,
+        currency: pricing.currency,
+      });
+    } catch (error) {
+      console.log(
+        "❌ CREATE TICKET PAYMENT INTENT ERROR:",
+        error
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Could not create ticket payment",
+      });
+    }
+  }
+);
+
 /* ===================================================== */
 /* 💳 CREATE STRIPE PAYMENT INTENT */
 /* ===================================================== */
@@ -1196,6 +2220,9 @@ app.post(
             },
 
             metadata: {
+              payment_type:
+                PAYMENT_TYPES.SUBSCRIPTION,
+
               user_id,
 
               plan:
@@ -1428,9 +2455,12 @@ app.post(
 
             metadata: {
               payment_type:
-                "advertisement",
+                PAYMENT_TYPES.ADVERTISEMENT,
 
               user_id,
+
+              reference_id:
+                campaign.id,
 
               campaign_id:
                 campaign.id,
@@ -1513,6 +2543,550 @@ app.post(
         error:
           error.message ||
           "Advertisement payment intent failed",
+      });
+    }
+  }
+);
+
+
+
+/* ===================================================== */
+/* 🎫 CREATE PAYPAL TICKET ORDER                         */
+/* ===================================================== */
+
+app.post(
+  "/create-ticket-order",
+  async (req, res) => {
+    try {
+      const {
+        user_id,
+        ticket_id,
+      } = req.body || {};
+
+      if (!user_id || !ticket_id) {
+        return res.status(400).json({
+          error:
+            "Missing user_id or ticket_id",
+        });
+      }
+
+      const ticket =
+        await loadTicketForPayment(ticket_id);
+
+      if (
+        String(ticket.user_id) !==
+        String(user_id)
+      ) {
+        return res.status(403).json({
+          error:
+            "This ticket belongs to another user",
+        });
+      }
+
+      if (
+        String(ticket.payment_status || "")
+          .toLowerCase() === "paid"
+      ) {
+        return res.status(409).json({
+          error:
+            "This ticket has already been paid",
+        });
+      }
+
+      const pricing =
+        ticketPricing(ticket);
+
+      const metadata = {
+        payment_type:
+          PAYMENT_TYPES.EVENT_TICKET,
+        user_id,
+        reference_id:
+          String(ticket.id),
+        ticket_id:
+          String(ticket.id),
+      };
+
+      const order = await createPayPalOrder({
+        description:
+          `Tunevora ticket - ${ticket.event_title || "Event"}`,
+        amount: pricing.total,
+        currency: pricing.currency,
+        metadata,
+        returnUrl: "tunevora://ticket-success",
+        cancelUrl: "tunevora://ticket-cancel",
+      });
+
+      return res.json({
+        ...order,
+        amount: pricing.total,
+        currency: pricing.currency,
+      });
+    } catch (error) {
+      console.log(
+        "❌ CREATE PAYPAL TICKET ERROR:",
+        error.response?.data ||
+          error.message
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Could not create ticket order",
+      });
+    }
+  }
+);
+
+/* ===================================================== */
+/* 🎫 CAPTURE PAYPAL TICKET ORDER                        */
+/* ===================================================== */
+
+app.post(
+  "/capture-ticket-order",
+  async (req, res) => {
+    try {
+      const {
+        orderID,
+        user_id,
+      } = req.body || {};
+
+      if (!orderID || !user_id) {
+        return res.status(400).json({
+          error:
+            "Missing orderID or user_id",
+        });
+      }
+
+      const existing =
+        await findPaymentByReference(
+          orderID
+        );
+
+      if (existing) {
+        if (
+          String(existing.user_id) !==
+          String(user_id)
+        ) {
+          return res.status(403).json({
+            error:
+              "This order belongs to another user",
+          });
+        }
+
+        return res.json({
+          success: true,
+          duplicate: true,
+          transaction_reference:
+            orderID,
+        });
+      }
+
+      const captureResponse =
+        await capturePayPalOrder(orderID);
+
+      const captured =
+        paypalCaptureData(
+          captureResponse
+        );
+
+      if (captured.status !== "COMPLETED") {
+        return res.status(400).json({
+          error:
+            "Ticket payment was not completed",
+          status: captured.status,
+        });
+      }
+
+      const paymentType = String(
+        captured.metadata.payment_type ||
+          ""
+      )
+        .trim()
+        .toLowerCase();
+
+      const metadataUserId = String(
+        captured.metadata.user_id || ""
+      ).trim();
+
+      const ticketId = String(
+        captured.metadata.reference_id ||
+          captured.metadata.ticket_id ||
+          ""
+      ).trim();
+
+      if (
+        paymentType !==
+          PAYMENT_TYPES.EVENT_TICKET ||
+        metadataUserId !==
+          String(user_id) ||
+        !ticketId
+      ) {
+        return res.status(403).json({
+          error:
+            "PayPal ticket metadata verification failed",
+        });
+      }
+
+      const ticket =
+        await loadTicketForPayment(ticketId);
+      const pricing =
+        ticketPricing(ticket);
+
+      if (
+        String(ticket.user_id) !==
+        String(user_id)
+      ) {
+        return res.status(403).json({
+          error:
+            "Ticket ownership verification failed",
+        });
+      }
+
+      if (
+        captured.currency !==
+          pricing.currency ||
+        !amountsMatch(
+          captured.amount,
+          pricing.total
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "PayPal ticket amount or currency did not match",
+        });
+      }
+
+      const {
+        error: updateError,
+      } = await supabase
+        .from("event_tickets")
+        .update({
+          payment_status: "paid",
+          status: "valid",
+        })
+        .eq("id", ticketId)
+        .eq("user_id", user_id);
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      await recordCommercePayment({
+        userId: user_id,
+        purchaseType:
+          PAYMENT_TYPES.EVENT_TICKET,
+        amount: captured.amount,
+        currency: captured.currency,
+        method: "PayPal",
+        reference: orderID,
+      });
+
+      await recordAdminRevenue({
+        source: "ticket_platform_fee",
+        amount: pricing.platformFee,
+        currency: captured.currency,
+      });
+
+      return res.json({
+        success: true,
+        ticket_id: ticketId,
+        amount: captured.amount,
+        currency: captured.currency,
+        transaction_reference:
+          orderID,
+      });
+    } catch (error) {
+      console.log(
+        "❌ CAPTURE PAYPAL TICKET ERROR:",
+        error.response?.data ||
+          error.message
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Ticket capture failed",
+      });
+    }
+  }
+);
+
+/* ===================================================== */
+/* 📢 CREATE PAYPAL AD ORDER                             */
+/* ===================================================== */
+
+app.post(
+  "/create-ad-order",
+  async (req, res) => {
+    try {
+      const {
+        user_id,
+        campaign_id,
+      } = req.body || {};
+
+      if (!user_id || !campaign_id) {
+        return res.status(400).json({
+          error:
+            "Missing user_id or campaign_id",
+        });
+      }
+
+      const campaign =
+        await loadCampaignForPayment(
+          campaign_id
+        );
+
+      if (
+        String(campaign.created_by) !==
+        String(user_id)
+      ) {
+        return res.status(403).json({
+          error:
+            "This campaign belongs to another user",
+        });
+      }
+
+      if (
+        String(campaign.payment_status || "")
+          .toLowerCase() === "paid"
+      ) {
+        return res.status(409).json({
+          error:
+            "This campaign has already been paid",
+        });
+      }
+
+      const pricing =
+        campaignPricing(campaign);
+
+      const metadata = {
+        payment_type:
+          PAYMENT_TYPES.ADVERTISEMENT,
+        user_id,
+        reference_id:
+          String(campaign.id),
+        campaign_id:
+          String(campaign.id),
+        ad_id:
+          String(campaign.ad_id || ""),
+      };
+
+      const order = await createPayPalOrder({
+        description:
+          "Tunevora advertisement campaign",
+        amount: pricing.amount,
+        currency: pricing.currency,
+        metadata,
+        returnUrl: "tunevora://ad-success",
+        cancelUrl: "tunevora://ad-cancel",
+      });
+
+      const {
+        error: updateError,
+      } = await supabase
+        .from("ad_campaigns")
+        .update({
+          payment_id: order.id,
+        })
+        .eq("id", campaign.id)
+        .eq("created_by", user_id);
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      return res.json({
+        ...order,
+        amount: pricing.amount,
+        currency: pricing.currency,
+      });
+    } catch (error) {
+      console.log(
+        "❌ CREATE PAYPAL AD ERROR:",
+        error.response?.data ||
+          error.message
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Could not create advertisement order",
+      });
+    }
+  }
+);
+
+/* ===================================================== */
+/* 📢 CAPTURE PAYPAL AD ORDER                            */
+/* ===================================================== */
+
+app.post(
+  "/capture-ad-order",
+  async (req, res) => {
+    try {
+      const {
+        orderID,
+        user_id,
+      } = req.body || {};
+
+      if (!orderID || !user_id) {
+        return res.status(400).json({
+          error:
+            "Missing orderID or user_id",
+        });
+      }
+
+      const existing =
+        await findPaymentByReference(
+          orderID
+        );
+
+      if (existing) {
+        if (
+          String(existing.user_id) !==
+          String(user_id)
+        ) {
+          return res.status(403).json({
+            error:
+              "This order belongs to another user",
+          });
+        }
+
+        return res.json({
+          success: true,
+          duplicate: true,
+          transaction_reference:
+            orderID,
+        });
+      }
+
+      const captureResponse =
+        await capturePayPalOrder(orderID);
+
+      const captured =
+        paypalCaptureData(
+          captureResponse
+        );
+
+      if (captured.status !== "COMPLETED") {
+        return res.status(400).json({
+          error:
+            "Advertisement payment was not completed",
+          status: captured.status,
+        });
+      }
+
+      const paymentType = String(
+        captured.metadata.payment_type ||
+          ""
+      )
+        .trim()
+        .toLowerCase();
+
+      const metadataUserId = String(
+        captured.metadata.user_id || ""
+      ).trim();
+
+      const campaignId = String(
+        captured.metadata.reference_id ||
+          captured.metadata.campaign_id ||
+          ""
+      ).trim();
+
+      if (
+        paymentType !==
+          PAYMENT_TYPES.ADVERTISEMENT ||
+        metadataUserId !==
+          String(user_id) ||
+        !campaignId
+      ) {
+        return res.status(403).json({
+          error:
+            "PayPal advertisement metadata verification failed",
+        });
+      }
+
+      const campaign =
+        await loadCampaignForPayment(
+          campaignId
+        );
+      const pricing =
+        campaignPricing(campaign);
+
+      if (
+        String(campaign.created_by) !==
+        String(user_id)
+      ) {
+        return res.status(403).json({
+          error:
+            "Campaign ownership verification failed",
+        });
+      }
+
+      if (
+        captured.currency !==
+          pricing.currency ||
+        !amountsMatch(
+          captured.amount,
+          pricing.amount
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            "PayPal advertisement amount or currency did not match",
+        });
+      }
+
+      const {
+        error: updateError,
+      } = await supabase
+        .from("ad_campaigns")
+        .update({
+          payment_status: "paid",
+          payment_id: orderID,
+        })
+        .eq("id", campaignId)
+        .eq("created_by", user_id);
+
+      if (updateError) {
+        throw updateError;
+      }
+
+      await recordCommercePayment({
+        userId: user_id,
+        purchaseType:
+          PAYMENT_TYPES.ADVERTISEMENT,
+        amount: captured.amount,
+        currency: captured.currency,
+        method: "PayPal",
+        reference: orderID,
+      });
+
+      await recordAdminRevenue({
+        source: "advertisement",
+        amount: captured.amount,
+        currency: captured.currency,
+      });
+
+      return res.json({
+        success: true,
+        campaign_id: campaignId,
+        amount: captured.amount,
+        currency: captured.currency,
+        transaction_reference:
+          orderID,
+      });
+    } catch (error) {
+      console.log(
+        "❌ CAPTURE PAYPAL AD ERROR:",
+        error.response?.data ||
+          error.message
+      );
+
+      return res.status(500).json({
+        error:
+          error.message ||
+          "Advertisement capture failed",
       });
     }
   }
