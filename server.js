@@ -55,10 +55,8 @@ let googlePlayPublisherClient = null;
 
 function readGoogleServiceAccount() {
   const rawValue = String(
-    process.env.GOOGLE_SERVICE_ACCOUNT_JSON ||
-      process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON ||
-      ""
-  ).trim();
+  process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON || ""
+).trim();
 
   if (!rawValue) {
     throw new Error(
@@ -1058,12 +1056,8 @@ console.log(
 
 console.log(
   "GOOGLE PLAY SERVICE ACCOUNT EXISTS:",
-  !!(
-    process.env.GOOGLE_SERVICE_ACCOUNT_JSON ||
-    process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
-  )
+  !!process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
 );
-
 
 /* ===================================================== */
 /* 🔔 STRIPE WEBHOOK                                     */
