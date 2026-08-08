@@ -282,6 +282,280 @@ async function syncGooglePlaySubscriptionPeriod({
   }
 }
 
+
+/* ===================================================== */
+/* 🔔 GOOGLE PLAY RTDN HELPERS                           */
+/* ===================================================== */
+
+function googlePlayPlanFromLineItems(lineItems) {
+  for (const item of lineItems || []) {
+    const productId = String(
+      item?.productId || ""
+    ).trim();
+
+    const plan =
+      GOOGLE_PLAY_PRODUCT_TO_PLAN.get(productId);
+
+    if (plan) {
+      return {
+        plan,
+        productId,
+      };
+    }
+  }
+
+  return null;
+}
+
+async function resolveGooglePlayUserId({
+  purchase,
+  purchaseToken,
+}) {
+  const externalAccountId = String(
+    purchase?.externalAccountIdentifiers
+      ?.obfuscatedExternalAccountId ||
+      ""
+  ).trim();
+
+  if (externalAccountId) {
+    const {
+      data: profile,
+      error: profileError,
+    } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", externalAccountId)
+      .maybeSingle();
+
+    if (profileError) {
+      throw profileError;
+    }
+
+    if (profile) {
+      return String(profile.id);
+    }
+  }
+
+  const transactionReference =
+    googlePlayReference(purchaseToken);
+
+  const {
+    data: payment,
+    error: paymentError,
+  } = await supabase
+    .from("payments")
+    .select("user_id")
+    .eq(
+      "transaction_reference",
+      transactionReference
+    )
+    .maybeSingle();
+
+  if (paymentError) {
+    throw paymentError;
+  }
+
+  return payment?.user_id
+    ? String(payment.user_id)
+    : null;
+}
+
+async function markGooglePlayAccessExpired({
+  userId,
+  plan,
+}) {
+  const {
+    error: profileError,
+  } = await supabase
+    .from("profiles")
+    .update({
+      is_premium: false,
+      plan: "free",
+      premium_until: null,
+      streaming_quality: "auto",
+      download_quality: "standard",
+    })
+    .eq("id", userId);
+
+  if (profileError) {
+    throw profileError;
+  }
+
+  const {
+    data: latestSubscription,
+    error: subscriptionLoadError,
+  } = await supabase
+    .from("subscriptions")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("plan", plan)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (subscriptionLoadError) {
+    throw subscriptionLoadError;
+  }
+
+  if (latestSubscription) {
+    const {
+      error: subscriptionUpdateError,
+    } = await supabase
+      .from("subscriptions")
+      .update({
+        status: "expired",
+      })
+      .eq("id", latestSubscription.id);
+
+    if (subscriptionUpdateError) {
+      throw subscriptionUpdateError;
+    }
+  }
+}
+
+async function syncGooglePlayRtdnPurchase({
+  purchaseToken,
+  notificationType,
+}) {
+  const publisher =
+    getGooglePlayPublisherClient();
+
+  const googleResponse =
+    await publisher.purchases.subscriptionsv2.get({
+      packageName:
+        GOOGLE_PLAY_PACKAGE_NAME,
+      token: purchaseToken,
+    });
+
+  const purchase =
+    googleResponse.data || {};
+
+  const lineItems = Array.isArray(
+    purchase.lineItems
+  )
+    ? purchase.lineItems
+    : [];
+
+  const productInfo =
+    googlePlayPlanFromLineItems(lineItems);
+
+  if (!productInfo) {
+    throw new Error(
+      "RTDN purchase did not contain a supported Tunevora subscription product"
+    );
+  }
+
+  const userId =
+    await resolveGooglePlayUserId({
+      purchase,
+      purchaseToken,
+    });
+
+  if (!userId) {
+    const error = new Error(
+      "RTDN purchase is not linked to a Tunevora user yet"
+    );
+
+    /*
+     * Returning a retryable error lets Pub/Sub redeliver.
+     * This is useful if RTDN arrives before the app's initial
+     * /verify-google-play-purchase call has stored the token hash.
+     */
+    error.statusCode = 503;
+    throw error;
+  }
+
+  await loadProfile(userId);
+
+  const subscriptionState = String(
+    purchase.subscriptionState || ""
+  );
+
+  let expiryTime = null;
+
+  try {
+    expiryTime =
+      latestGooglePlayExpiry(lineItems);
+  } catch (_) {
+    expiryTime = null;
+  }
+
+  const isEntitledState =
+    GOOGLE_PLAY_ENTITLED_STATES.has(
+      subscriptionState
+    );
+
+  const hasFutureExpiry =
+    expiryTime != null &&
+    expiryTime.getTime() > Date.now();
+
+  const shouldKeepAccess =
+    isEntitledState &&
+    hasFutureExpiry;
+
+  if (shouldKeepAccess) {
+    const {
+      error: profileError,
+    } = await supabase
+      .from("profiles")
+      .update({
+        is_premium: true,
+        plan: productInfo.plan,
+        premium_until:
+          expiryTime.toISOString(),
+      })
+      .eq("id", userId);
+
+    if (profileError) {
+      throw profileError;
+    }
+
+    await syncGooglePlaySubscriptionPeriod({
+      userId,
+      plan: productInfo.plan,
+      expiryTime,
+    });
+  } else {
+    await markGooglePlayAccessExpired({
+      userId,
+      plan: productInfo.plan,
+    });
+  }
+
+  console.log(
+    "✅ GOOGLE PLAY RTDN SYNCED:",
+    {
+      user_id: userId,
+      product_id:
+        productInfo.productId,
+      plan:
+        productInfo.plan,
+      notification_type:
+        notificationType,
+      state:
+        subscriptionState,
+      premium_until:
+        shouldKeepAccess
+          ? expiryTime.toISOString()
+          : null,
+      access:
+        shouldKeepAccess
+          ? "active"
+          : "revoked",
+    }
+  );
+
+  return {
+    userId,
+    plan: productInfo.plan,
+    productId:
+      productInfo.productId,
+    subscriptionState,
+    expiryTime,
+    shouldKeepAccess,
+  };
+}
+
 /* ===================================================== */
 /* 🧩 UNIFIED PAYMENT HELPERS                            */
 /* ===================================================== */
@@ -1100,6 +1374,11 @@ console.log(
   !!process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
 );
 
+console.log(
+  "GOOGLE PLAY RTDN SECRET EXISTS:",
+  !!process.env.GOOGLE_PLAY_RTDN_SECRET
+);
+
 /* ===================================================== */
 /* 🔔 STRIPE WEBHOOK                                     */
 /* MUST STAY BEFORE bodyParser.json()                    */
@@ -1193,6 +1472,202 @@ app.post(
  * the Stripe webhook.
  */
 app.use(bodyParser.json());
+
+/* ===================================================== */
+/* 🔔 GOOGLE PLAY REAL-TIME DEVELOPER NOTIFICATIONS      */
+/* ===================================================== */
+
+app.post(
+  "/google-play-rtdn",
+  async (req, res) => {
+    try {
+      const configuredSecret = String(
+        process.env.GOOGLE_PLAY_RTDN_SECRET ||
+          ""
+      ).trim();
+
+      if (!configuredSecret) {
+        console.log(
+          "❌ GOOGLE PLAY RTDN SECRET IS MISSING"
+        );
+
+        return res.status(503).json({
+          error:
+            "Google Play RTDN endpoint is not configured",
+        });
+      }
+
+      const suppliedSecret = String(
+        req.query.token || ""
+      ).trim();
+
+      const expectedBuffer = Buffer.from(
+        configuredSecret,
+        "utf8"
+      );
+
+      const suppliedBuffer = Buffer.from(
+        suppliedSecret,
+        "utf8"
+      );
+
+      const secretMatches =
+        expectedBuffer.length ===
+          suppliedBuffer.length &&
+        crypto.timingSafeEqual(
+          expectedBuffer,
+          suppliedBuffer
+        );
+
+      if (!secretMatches) {
+        return res.status(401).json({
+          error: "Unauthorized",
+        });
+      }
+
+      const pubsubMessage =
+        req.body?.message;
+
+      const encodedData = String(
+        pubsubMessage?.data || ""
+      ).trim();
+
+      if (!encodedData) {
+        return res.status(400).json({
+          error:
+            "Missing Pub/Sub message data",
+        });
+      }
+
+      let notification;
+
+      try {
+        const decoded = Buffer.from(
+          encodedData,
+          "base64"
+        ).toString("utf8");
+
+        notification = JSON.parse(decoded);
+      } catch (_) {
+        return res.status(400).json({
+          error:
+            "Invalid Google Play RTDN payload",
+        });
+      }
+
+      if (
+        String(
+          notification.packageName || ""
+        ) !== GOOGLE_PLAY_PACKAGE_NAME
+      ) {
+        return res.status(400).json({
+          error:
+            "RTDN package name does not match Tunevora",
+        });
+      }
+
+      if (notification.testNotification) {
+        console.log(
+          "✅ GOOGLE PLAY RTDN TEST RECEIVED",
+          {
+            message_id:
+              pubsubMessage?.messageId ||
+              null,
+          }
+        );
+
+        return res.status(204).send();
+      }
+
+      const subscriptionNotification =
+        notification.subscriptionNotification;
+
+      if (subscriptionNotification) {
+        const purchaseToken = String(
+          subscriptionNotification.purchaseToken ||
+            ""
+        ).trim();
+
+        const notificationType = Number(
+          subscriptionNotification.notificationType
+        );
+
+        if (!purchaseToken) {
+          return res.status(400).json({
+            error:
+              "RTDN subscription purchase token is missing",
+          });
+        }
+
+        await syncGooglePlayRtdnPurchase({
+          purchaseToken,
+          notificationType,
+        });
+
+        return res.status(204).send();
+      }
+
+      const voidedPurchase =
+        notification.voidedPurchaseNotification;
+
+      if (
+        voidedPurchase &&
+        Number(voidedPurchase.productType) === 1
+      ) {
+        const purchaseToken = String(
+          voidedPurchase.purchaseToken ||
+            ""
+        ).trim();
+
+        if (!purchaseToken) {
+          return res.status(400).json({
+            error:
+              "Voided subscription purchase token is missing",
+          });
+        }
+
+        await syncGooglePlayRtdnPurchase({
+          purchaseToken,
+          notificationType:
+            "VOIDED_PURCHASE",
+        });
+
+        return res.status(204).send();
+      }
+
+      /*
+       * This Tunevora topic is configured for subscriptions
+       * and voided purchases. Ignore notification variants
+       * that are not relevant to subscription entitlement.
+       */
+      console.log(
+        "ℹ️ GOOGLE PLAY RTDN IGNORED:",
+        Object.keys(notification)
+      );
+
+      return res.status(204).send();
+    } catch (error) {
+      const statusCode =
+        Number(error.statusCode) ||
+        500;
+
+      console.log(
+        "❌ GOOGLE PLAY RTDN ERROR:",
+        error
+      );
+
+      /*
+       * 5xx responses tell Pub/Sub to retry later.
+       * 4xx responses indicate a bad/unauthorized request.
+       */
+      return res.status(statusCode).json({
+        error:
+          error.message ||
+          "Google Play RTDN processing failed",
+      });
+    }
+  }
+);
 
 
 /* ===================================================== */
