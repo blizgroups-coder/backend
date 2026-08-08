@@ -13,6 +13,47 @@ const stripe = new Stripe(
 const app = express();
 
 /* ===================================================== */
+/* 🌐 CORS - TUNEVORA WEB                               */
+/* ===================================================== */
+
+const allowedOrigins = new Set([
+  "https://tunevora.com",
+  "https://www.tunevora.com",
+]);
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin && allowedOrigins.has(origin)) {
+    res.header(
+      "Access-Control-Allow-Origin",
+      origin
+    );
+
+    res.header(
+      "Vary",
+      "Origin"
+    );
+  }
+
+  res.header(
+    "Access-Control-Allow-Methods",
+    "GET,POST,OPTIONS"
+  );
+
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, Accept"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
+/* ===================================================== */
 /* 🔐 SUPABASE */
 /* ===================================================== */
 
