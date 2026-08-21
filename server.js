@@ -1878,6 +1878,225 @@ async function loadSubscriptionPrice(
 }
 
 /* ===================================================== */
+/* 💱 PAYPAL FX CONVERSION + DAILY CACHE                 */
+/* ===================================================== */
+
+const FX_CACHE_MAX_AGE_MS =
+  24 * 60 * 60 * 1000;
+
+async function loadCurrencyToUsdRate(
+  sourceCurrency
+) {
+  const source =
+    normalizeCurrency(sourceCurrency);
+
+  if (source === "USD") {
+    return 1;
+  }
+
+  const minimumFetchedAt =
+    new Date(
+      Date.now() -
+        FX_CACHE_MAX_AGE_MS
+    ).toISOString();
+
+  const {
+    data: cachedRate,
+    error: cachedRateError,
+  } = await supabase
+    .from("fx_rates")
+    .select(`
+      rate,
+      fetched_at
+    `)
+    .eq(
+      "base_currency",
+      source
+    )
+    .eq(
+      "quote_currency",
+      "USD"
+    )
+    .gte(
+      "fetched_at",
+      minimumFetchedAt
+    )
+    .maybeSingle();
+
+  if (cachedRateError) {
+    throw cachedRateError;
+  }
+
+  const cachedNumericRate =
+    Number(cachedRate?.rate);
+
+  if (
+    Number.isFinite(
+      cachedNumericRate
+    ) &&
+    cachedNumericRate > 0
+  ) {
+    console.log(
+      "✅ FX CACHE HIT:",
+      {
+        from: source,
+        to: "USD",
+        rate:
+          cachedNumericRate,
+      }
+    );
+
+    return cachedNumericRate;
+  }
+
+  /*
+   * Optional production API key.
+   *
+   * If EXCHANGE_RATE_API_KEY exists,
+   * use the authenticated endpoint.
+   * Otherwise use the open endpoint.
+   */
+  const apiKey =
+    String(
+      process.env
+        .EXCHANGE_RATE_API_KEY ||
+        ""
+    ).trim();
+
+  const fxUrl =
+    apiKey
+      ? `https://v6.exchangerate-api.com/v6/${encodeURIComponent(
+          apiKey
+        )}/latest/USD`
+      : "https://open.er-api.com/v6/latest/USD";
+
+  const fxResponse =
+    await axios.get(
+      fxUrl,
+      {
+        timeout: 15000,
+      }
+    );
+
+  const payload =
+    fxResponse.data || {};
+
+  if (
+    String(payload.result) !==
+    "success"
+  ) {
+    throw new Error(
+      "Currency exchange-rate service returned an error"
+    );
+  }
+
+  /*
+   * Authenticated API:
+   * conversion_rates
+   *
+   * Open API:
+   * rates
+   */
+  const rates =
+    payload.conversion_rates ||
+    payload.rates ||
+    {};
+
+  const usdToSourceRate =
+    Number(rates[source]);
+
+  if (
+    !Number.isFinite(
+      usdToSourceRate
+    ) ||
+    usdToSourceRate <= 0
+  ) {
+    throw new Error(
+      `USD exchange rate for ${source} was not available`
+    );
+  }
+
+  /*
+   * Provider returns:
+   *
+   * 1 USD = X source currency
+   *
+   * We need:
+   *
+   * 1 source currency = X USD
+   */
+  const sourceToUsdRate =
+    1 / usdToSourceRate;
+
+  let providerUpdatedAt = null;
+
+  const providerTimestamp =
+    Number(
+      payload.time_last_update_unix
+    );
+
+  if (
+    Number.isFinite(
+      providerTimestamp
+    ) &&
+    providerTimestamp > 0
+  ) {
+    providerUpdatedAt =
+      new Date(
+        providerTimestamp * 1000
+      ).toISOString();
+  }
+
+  const {
+    error: cacheSaveError,
+  } = await supabase
+    .from("fx_rates")
+    .upsert(
+      {
+        base_currency:
+          source,
+
+        quote_currency:
+          "USD",
+
+        rate:
+          sourceToUsdRate,
+
+        provider:
+          apiKey
+            ? "ExchangeRate-API"
+            : "ExchangeRate-API Open",
+
+        provider_updated_at:
+          providerUpdatedAt,
+
+        fetched_at:
+          new Date().toISOString(),
+      },
+      {
+        onConflict:
+          "base_currency,quote_currency",
+      }
+    );
+
+  if (cacheSaveError) {
+    throw cacheSaveError;
+  }
+
+  console.log(
+    "✅ LIVE FX RATE LOADED:",
+    {
+      from: source,
+      to: "USD",
+      rate:
+        sourceToUsdRate,
+    }
+  );
+
+  return sourceToUsdRate;
+}
+
+/* ===================================================== */
 /* 💵 LOAD PAYPAL-SAFE SUBSCRIPTION PRICE                */
 /* ===================================================== */
 
@@ -1891,43 +2110,119 @@ async function loadPayPalSubscriptionPrice(
       country
     );
 
+  /*
+   * If PayPal already supports the
+   * Tunevora local currency, use the
+   * local price directly.
+   */
   if (
     PAYPAL_SUPPORTED_CURRENCIES.has(
       localPricing.currency
     )
   ) {
-    return localPricing;
+    return {
+      ...localPricing,
+
+      localAmount:
+        localPricing.amount,
+
+      localCurrency:
+        localPricing.currency,
+
+      fxRate: 1,
+    };
   }
 
-  const usdPricing =
-    await loadSubscriptionPrice(
-      plan,
-      "US"
+  /*
+   * Example:
+   *
+   * UAE Premium:
+   * AED 36.99
+   *
+   * PayPal does not accept AED,
+   * so convert the actual AED 36.99
+   * price into USD.
+   */
+  const sourceToUsdRate =
+    await loadCurrencyToUsdRate(
+      localPricing.currency
     );
 
-  if (usdPricing.currency !== "USD") {
+  const convertedAmount =
+    Number(
+      (
+        localPricing.amount *
+        sourceToUsdRate
+      ).toFixed(2)
+    );
+
+  if (
+    !Number.isFinite(
+      convertedAmount
+    ) ||
+    convertedAmount <= 0
+  ) {
     throw new Error(
-      "Tunevora US PayPal fallback price must use USD"
+      "PayPal converted subscription amount is invalid"
     );
   }
 
   console.log(
-    "ℹ️ PAYPAL CURRENCY FALLBACK:",
+    "💱 PAYPAL PRICE CONVERSION:",
     {
-      requested_country:
-        String(country || "").toUpperCase(),
+      country:
+        localPricing.country,
+
+      plan:
+        localPricing.plan,
+
       local_amount:
         localPricing.amount,
+
       local_currency:
         localPricing.currency,
+
+      fx_rate:
+        sourceToUsdRate,
+
       paypal_amount:
-        usdPricing.amount,
+        convertedAmount,
+
       paypal_currency:
-        usdPricing.currency,
+        "USD",
     }
   );
 
-  return usdPricing;
+  return {
+    plan:
+      localPricing.plan,
+
+    country:
+      localPricing.country,
+
+    /*
+     * These are the actual values
+     * PayPal will charge.
+     */
+    amount:
+      convertedAmount,
+
+    currency:
+      "USD",
+
+    /*
+     * Keep original Tunevora price
+     * available for UI/logging.
+     */
+    localAmount:
+      localPricing.amount,
+
+    localCurrency:
+      localPricing.currency,
+
+    fxRate:
+      sourceToUsdRate,
+  };
 }
 
 /* ===================================================== */
@@ -2121,7 +2416,16 @@ app.post(
 
         currency:
           pricing.currency,
-      });
+
+        local_amount:
+          pricing.localAmount,
+
+        local_currency:
+          pricing.localCurrency,
+
+        fx_rate:
+          pricing.fxRate,
+     });
     } catch (error) {
       console.log(
         "❌ CREATE PAYPAL ERROR:",
@@ -2324,11 +2628,38 @@ app.post(
         });
       }
 
-      const expectedPricing =
-        await loadPayPalSubscriptionPrice(
+      const expectedPricing = {
+        plan:
           selectedPlan,
-          metadataCountry
-        );
+
+       amount:
+         Number(
+           paymentInfo.amount
+      ),
+
+      currency:
+         String(
+           paymentInfo.currency ||
+             ""
+        )
+          .trim()
+          .toUpperCase(),
+  };
+
+  if (
+     !Number.isFinite(
+       expectedPricing.amount
+     ) ||
+     expectedPricing.amount <= 0 ||
+     !/^[A-Z]{3}$/.test(
+       expectedPricing.currency
+     )
+    ) {
+      return res.status(400).json({
+        error:
+      "Invalid PayPal order pricing metadata",
+     });
+   }
 
       const capturedAmount =
         Number(
