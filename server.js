@@ -2284,6 +2284,148 @@ async function getAccessToken() {
 }
 
 /* ===================================================== */
+/* 🔐 PAYPAL RETURN STATE                                */
+/* ===================================================== */
+
+function getPayPalReturnStateKey() {
+  const paypalSecret = String(
+    process.env.PAYPAL_SECRET ||
+      process.env.PAYPAL_CLIENT_SECRET ||
+      ""
+  ).trim();
+
+  if (!paypalSecret) {
+    throw new Error(
+      "PayPal credentials are missing"
+    );
+  }
+
+  return crypto
+    .createHash("sha256")
+    .update(
+      `tunevora-paypal-return-v1:${paypalSecret}`
+    )
+    .digest();
+}
+
+function createPayPalReturnState(userId) {
+  const payload = Buffer.from(
+    JSON.stringify({
+      user_id: String(userId),
+      expires_at:
+        Date.now() + 15 * 60 * 1000,
+    }),
+    "utf8"
+  ).toString("base64url");
+
+  const signature = crypto
+    .createHmac(
+      "sha256",
+      getPayPalReturnStateKey()
+    )
+    .update(payload)
+    .digest("base64url");
+
+  return `${payload}.${signature}`;
+}
+
+function verifyPayPalReturnState(state) {
+  const parts =
+    String(state || "").split(".");
+
+  if (parts.length !== 2) {
+    const error = new Error(
+      "Invalid PayPal return state"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const [
+    payload,
+    suppliedSignature,
+  ] = parts;
+
+  const expectedSignature = crypto
+    .createHmac(
+      "sha256",
+      getPayPalReturnStateKey()
+    )
+    .update(payload)
+    .digest("base64url");
+
+  const suppliedBuffer =
+    Buffer.from(
+      suppliedSignature,
+      "utf8"
+    );
+
+  const expectedBuffer =
+    Buffer.from(
+      expectedSignature,
+      "utf8"
+    );
+
+  if (
+    suppliedBuffer.length !==
+      expectedBuffer.length ||
+    !crypto.timingSafeEqual(
+      suppliedBuffer,
+      expectedBuffer
+    )
+  ) {
+    const error = new Error(
+      "Invalid PayPal return state"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  let decoded;
+
+  try {
+    decoded = JSON.parse(
+      Buffer.from(
+        payload,
+        "base64url"
+      ).toString("utf8")
+    );
+  } catch (_) {
+    const error = new Error(
+      "Invalid PayPal return state"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  const userId =
+    String(
+      decoded.user_id || ""
+    ).trim();
+
+  const expiresAt =
+    Number(decoded.expires_at);
+
+  const validUserId =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      .test(userId);
+
+  if (
+    !validUserId ||
+    !Number.isFinite(expiresAt) ||
+    expiresAt < Date.now()
+  ) {
+    const error = new Error(
+      "Expired or invalid PayPal return state"
+    );
+    error.statusCode = 401;
+    throw error;
+  }
+
+  return userId;
+}
+
+/* ===================================================== */
 /* 💳 CREATE PAYPAL ORDER                                */
 /* ===================================================== */
 
@@ -2295,6 +2437,9 @@ app.post(
         "🔥 CREATE PAYPAL ORDER HIT"
       );
 
+      const authenticatedUser =
+        await authenticateSupabaseRequest(req);
+
       const {
         user_id,
         plan,
@@ -2305,6 +2450,16 @@ app.post(
         return res.status(400).json({
           error:
             "Missing user_id or plan",
+        });
+      }
+
+      if (
+        String(user_id) !==
+        String(authenticatedUser.id)
+      ) {
+        return res.status(403).json({
+          error:
+            "Payment user does not match the authenticated Tunevora account",
         });
       }
 
@@ -2340,10 +2495,15 @@ app.post(
       const publicBaseUrl =
         paymentPublicBaseUrl(req);
 
+      const paypalReturnState =
+        createPayPalReturnState(
+          authenticatedUser.id
+        );
+
       const paypalReturnUrl =
-        `${publicBaseUrl}/paypal-return?user_id=${encodeURIComponent(
-         user_id
-      )}`;
+       `${publicBaseUrl}/paypal-return?state=${encodeURIComponent(
+         paypalReturnState
+       )}`;
 
       const paypalCancelUrl =
         `${publicBaseUrl}/paypal-cancel`;
@@ -2449,9 +2609,18 @@ app.post(
         )
       );
 
-      return res.status(500).json({
+      const statusCode =
+        Number(error?.statusCode) >= 400 &&
+        Number(error?.statusCode) < 600
+          ? Number(error.statusCode)
+          : 500;
+
+      return res.status(statusCode).json({
         error:
-          "Create order failed",
+          statusCode === 401 ||
+          statusCode === 403
+            ? error.message
+            : "Create order failed",
       });
     }
   }
@@ -2471,15 +2640,49 @@ app.post(
 
       const {
         orderID,
-        user_id,
+        user_id: requestedUserId,
+        paypal_state: paypalState,
       } = req.body || {};
 
-      if (!orderID || !user_id) {
+      if (!orderID) {
         return res.status(400).json({
           error:
-            "Missing orderID or user_id",
+            "Missing PayPal orderID",
         });
       }
+
+      let user_id;
+
+      const authorizationHeader =
+        String(
+          req.headers.authorization || ""
+        ).trim();
+
+      if (authorizationHeader) {
+        const authenticatedUser =
+          await authenticateSupabaseRequest(
+            req
+          );
+
+      user_id =
+        String(authenticatedUser.id);
+
+      if (
+        requestedUserId &&
+        String(requestedUserId) !==
+          user_id
+      ) {
+        return res.status(403).json({
+          error:
+            "Payment user does not match the authenticated Tunevora account",
+        });
+      } 
+    } else {
+      user_id =
+        verifyPayPalReturnState(
+          paypalState
+       );
+    }
 
       /*
        * Prevent processing the same
@@ -2544,12 +2747,16 @@ app.post(
      const accessToken =
   await getAccessToken();
 
-const capture =
-  await axios.post(
+/*
+ * Verify the PayPal order BEFORE capture.
+ * Never capture an order belonging to
+ * another Tunevora account.
+ */
+const preCaptureOrder =
+  await axios.get(
     `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
       orderID
-    )}/capture`,
-    {},
+    )}`,
     {
       headers: {
         Authorization:
@@ -2557,14 +2764,208 @@ const capture =
 
         "Content-Type":
           "application/json",
-
-        Prefer:
-          "return=representation",
       },
 
       timeout: 30000,
     }
   );
+
+const prePurchaseUnit =
+  preCaptureOrder.data
+    ?.purchase_units?.[0];
+
+let prePaymentInfo = {};
+
+try {
+  prePaymentInfo =
+    JSON.parse(
+      prePurchaseUnit?.custom_id ||
+        "{}"
+    );
+} catch (_) {
+  prePaymentInfo = {};
+}
+
+const preMetadataUserId =
+  String(
+    prePaymentInfo.user_id || ""
+  ).trim();
+
+const preSelectedPlan =
+  String(
+    prePaymentInfo.plan || ""
+  )
+    .trim()
+    .toLowerCase();
+
+const preMetadataAmount =
+  Number(
+    prePaymentInfo.amount
+  );
+
+const preMetadataCurrency =
+  String(
+    prePaymentInfo.currency || ""
+  )
+    .trim()
+    .toUpperCase();
+
+const preOrderAmount =
+  Number(
+    prePurchaseUnit
+      ?.amount
+      ?.value
+  );
+
+const preOrderCurrency =
+  String(
+    prePurchaseUnit
+      ?.amount
+      ?.currency_code ||
+      ""
+  )
+    .trim()
+    .toUpperCase();
+
+if (
+  preMetadataUserId !==
+  user_id
+) {
+  return res.status(403).json({
+    error:
+      "PayPal order belongs to another Tunevora account",
+  });
+}
+
+if (
+  !ALLOWED_SUBSCRIPTION_PLANS.includes(
+    preSelectedPlan
+  )
+) {
+  return res.status(400).json({
+    error:
+      "Invalid PayPal subscription order",
+  });
+}
+
+if (
+  !Number.isFinite(
+    preMetadataAmount
+  ) ||
+  preMetadataAmount <= 0 ||
+  !/^[A-Z]{3}$/.test(
+    preMetadataCurrency
+  )
+) {
+  return res.status(400).json({
+    error:
+      "Invalid PayPal order pricing metadata",
+  });
+}
+
+const preAmountMatches =
+  Number.isFinite(
+    preOrderAmount
+  ) &&
+  Math.abs(
+    preOrderAmount -
+      preMetadataAmount
+  ) < 0.001;
+
+const preCurrencyMatches =
+  preOrderCurrency ===
+  preMetadataCurrency;
+
+if (
+  !preAmountMatches ||
+  !preCurrencyMatches
+) {
+  return res.status(400).json({
+    error:
+      "PayPal order amount or currency verification failed",
+  });
+}
+
+let capture;
+
+try {
+  capture =
+    await axios.post(
+      `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+        orderID
+      )}/capture`,
+      {},
+      {
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
+
+          "Content-Type":
+            "application/json",
+
+          Prefer:
+            "return=representation",
+        },
+
+        timeout: 30000,
+      }
+    );
+} catch (captureError) {
+  /*
+   * Recovery protection:
+   *
+   * PayPal may have completed the capture even
+   * when our server did not receive the response
+   * because of a timeout/network/database failure.
+   *
+   * Load the order before treating the retry
+   * as a failed payment.
+   */
+  console.log(
+    "⚠️ PAYPAL CAPTURE ERROR - CHECKING ORDER STATUS:",
+    captureError.response?.data?.name ||
+      captureError.message
+  );
+
+  const orderLookup =
+    await axios.get(
+      `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+        orderID
+      )}`,
+      {
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
+
+          "Content-Type":
+            "application/json",
+        },
+
+        timeout: 30000,
+      }
+    );
+
+  const recoveredStatus =
+    String(
+      orderLookup.data?.status || ""
+    )
+      .trim()
+      .toUpperCase();
+
+  if (recoveredStatus !== "COMPLETED") {
+    throw captureError;
+  }
+
+  console.log(
+    "✅ PAYPAL COMPLETED ORDER RECOVERED:",
+    orderID
+  );
+
+  capture = {
+    data:
+      orderLookup.data,
+  };
+}
 
       if (
         capture.data.status !==
@@ -2738,155 +3139,93 @@ const capture =
         });
       }
 
-      const premiumUntil =
-        new Date(
-          Date.now() +
-            30 *
-              24 *
-              60 *
-              60 *
-              1000
-        );
-
       const {
-        error: profileUpdateError,
-      } = await supabase
-        .from("profiles")
-        .update({
-          is_premium: true,
+  data: finalizeResult,
+  error: finalizeError,
+} = await supabase.rpc(
+  "finalize_paypal_subscription",
+  {
+    p_user_id:
+      user_id,
 
-          plan:
-            expectedPricing.plan,
+    p_plan:
+      expectedPricing.plan,
 
-          premium_until:
-            premiumUntil.toISOString(),
-        })
-        .eq("id", user_id);
+    p_amount:
+      capturedAmount,
 
-      if (profileUpdateError) {
-        throw profileUpdateError;
-      }
+    p_currency:
+      capturedCurrency,
 
-      const {
-        error: paymentError,
-      } = await supabase
-        .from("payments")
-        .insert({
-          user_id,
+    p_transaction_reference:
+      orderID,
+  }
+);
 
-          plan:
-            expectedPricing.plan,
+if (finalizeError) {
+  throw finalizeError;
+}
 
-          amount:
-            capturedAmount,
+const finalized =
+  finalizeResult || {};
 
-          currency:
-            capturedCurrency,
+const finalizedPlan =
+  String(
+    finalized.plan ||
+      expectedPricing.plan
+  );
 
-          status:
-            "completed",
+const finalizedAmount =
+  Number(
+    finalized.amount ??
+      capturedAmount
+  );
 
-          payment_method:
-            "PayPal",
+const finalizedCurrency =
+  String(
+    finalized.currency ||
+      capturedCurrency
+  );
 
-          transaction_reference:
-            orderID,
-        });
+const finalizedReference =
+  String(
+    finalized.transaction_reference ||
+      orderID
+  );
 
-      if (paymentError) {
-        if (
-          paymentError.code === "23505"
-        ) {
-          return res.json({
-            success: true,
+const wasDuplicate =
+  finalized.duplicate === true;
 
-            duplicate: true,
+console.log(
+  wasDuplicate
+    ? `✅ PAYPAL ALREADY FINALIZED: ${user_id} → ${finalizedPlan}`
+    : `✅ PAYPAL ACTIVATED: ${user_id} → ${finalizedPlan}`
+);
 
-            message:
-              `${expectedPricing.plan} already activated`,
+return res.json({
+  success: true,
 
-            amount:
-              capturedAmount,
+  duplicate:
+    wasDuplicate,
 
-            currency:
-              capturedCurrency,
+  message:
+    wasDuplicate
+      ? `${finalizedPlan} already activated`
+      : `${finalizedPlan} activated`,
 
-            transaction_reference:
-              orderID,
-          });
-        }
+  amount:
+    finalizedAmount,
 
-        throw paymentError;
-      }
+  currency:
+    finalizedCurrency,
 
-      const {
-        error: subscriptionError,
-      } = await supabase
-        .from("subscriptions")
-        .insert({
-          user_id,
+  transaction_reference:
+    finalizedReference,
 
-          plan:
-            expectedPricing.plan,
-
-          status:
-            "active",
-
-          amount:
-            capturedAmount,
-
-          currency:
-            capturedCurrency,
-
-          expires_at:
-            premiumUntil.toISOString(),
-        });
-
-      if (subscriptionError) {
-        throw subscriptionError;
-      }
-
-      const {
-        error: revenueError,
-      } = await supabase
-        .from("admin_revenue")
-        .insert({
-          source:
-            expectedPricing.plan,
-
-          amount:
-            capturedAmount,
-
-          currency:
-            capturedCurrency,
-        });
-
-      if (revenueError) {
-        throw revenueError;
-      }
-
-      console.log(
-        `✅ PAYPAL ACTIVATED: ${user_id} → ${expectedPricing.plan}`
-      );
-
-      return res.json({
-        success: true,
-
-        message:
-          `${expectedPricing.plan} activated`,
-
-        amount:
-          capturedAmount,
-
-        currency:
-          capturedCurrency,
-
-        transaction_reference:
-          orderID,
-
-        premium_until:
-          premiumUntil.toISOString(),
-      });
+  premium_until:
+    finalized.premium_until ||
+    null,
+});
     } catch (error) {
       const paypalIssue =
         error.response?.data;
@@ -2897,9 +3236,15 @@ const capture =
           error.message
       );
 
-      return res.status(500).json({
+      const statusCode =
+        Number(error.statusCode) ||
+        500;
+
+      return res.status(statusCode).json({
         error:
-          "Capture failed",
+          statusCode >= 500
+            ? "Capture failed"
+            : error.message,
       });
     }
   }
@@ -2914,20 +3259,20 @@ app.get(
   (req, res) => {
     console.log("🌐 PAYPAL RETURN HIT");
 
-    const userId =
+    const paypalState =
       String(
-        req.query.user_id || ""
+        req.query.state || ""
       ).trim();
 
-    const validUserId =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-        .test(userId);
-
-    if (!validUserId) {
+    try {
+      verifyPayPalReturnState(
+        paypalState
+      );
+    } catch (_) {
       return res
         .status(400)
         .send(
-          "Invalid Tunevora payment return."
+          "Invalid or expired Tunevora payment return."
         );
     }
 
@@ -3010,8 +3355,8 @@ main{
       params.get("token") || ""
     ).trim();
 
-  const userId =
-    ${JSON.stringify(userId)};
+  const paypalState =
+    ${JSON.stringify(paypalState)};
 
   const title =
     document.getElementById(
@@ -3059,8 +3404,8 @@ main{
               orderID:
                 orderID,
 
-              user_id:
-                userId,
+              paypal_state:
+                paypalState,
             }),
         }
       );
