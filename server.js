@@ -19,34 +19,76 @@ const app = express();
 const allowedOrigins = new Set([
   "https://tunevora.com",
   "https://www.tunevora.com",
+
+  ...String(
+    process.env.CORS_ALLOWED_ORIGINS || ""
+  )
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
 ]);
 
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
+function isAllowedCorsOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
 
-  if (origin && allowedOrigins.has(origin)) {
-    res.header(
+  if (allowedOrigins.has(origin)) {
+    return true;
+  }
+
+  if (
+    /^http:\/\/localhost(?::\d+)?$/i.test(origin) ||
+    /^http:\/\/127\.0\.0\.1(?::\d+)?$/i.test(origin)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+app.use((req, res, next) => {
+  const origin = String(
+    req.headers.origin || ""
+  ).trim();
+
+  if (origin && isAllowedCorsOrigin(origin)) {
+    res.setHeader(
       "Access-Control-Allow-Origin",
       origin
     );
 
-    res.header(
+    res.setHeader(
       "Vary",
       "Origin"
     );
+
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,POST,OPTIONS"
+    );
+
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, Accept"
+    );
+
+    res.setHeader(
+      "Access-Control-Max-Age",
+      "86400"
+    );
   }
 
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET,POST,OPTIONS"
-  );
-
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, Accept"
-  );
-
   if (req.method === "OPTIONS") {
+    if (
+      origin &&
+      !isAllowedCorsOrigin(origin)
+    ) {
+      return res.status(403).json({
+        error: "Origin not allowed",
+      });
+    }
+
     return res.sendStatus(204);
   }
 
