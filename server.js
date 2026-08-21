@@ -1509,15 +1509,198 @@ app.post(
   }
 );
 
-/*
- * Normal JSON parser must come after
- * the Stripe webhook.
- */
-app.use(bodyParser.json());
+/* ===================================================== */
+/* 🔔 PAYPAL WEBHOOK                                     */
+/* MUST STAY BEFORE bodyParser.json()                    */
+/* ===================================================== */
 
-/* ===================================================== */
-/* 🔔 GOOGLE PLAY REAL-TIME DEVELOPER NOTIFICATIONS      */
-/* ===================================================== */
+app.post(
+  "/paypal-webhook",
+  express.raw({
+    type: "application/json",
+  }),
+  async (req, res) => {
+    try {
+      const webhookId =
+        String(
+          process.env.PAYPAL_WEBHOOK_ID ||
+            ""
+        ).trim();
+
+      if (!webhookId) {
+        console.log(
+          "❌ PAYPAL WEBHOOK ID IS MISSING"
+        );
+
+        return res.status(503).json({
+          error:
+            "PayPal webhook is not configured",
+        });
+      }
+
+      const rawBody =
+        Buffer.isBuffer(req.body)
+          ? req.body.toString("utf8")
+          : "";
+
+      let event;
+
+      try {
+        event = JSON.parse(rawBody);
+      } catch (_) {
+        return res.status(400).json({
+          error:
+            "Invalid PayPal webhook JSON",
+        });
+      }
+
+      const authAlgo =
+        String(
+          req.headers[
+            "paypal-auth-algo"
+          ] || ""
+        ).trim();
+
+      const certUrl =
+        String(
+          req.headers[
+            "paypal-cert-url"
+          ] || ""
+        ).trim();
+
+      const transmissionId =
+        String(
+          req.headers[
+            "paypal-transmission-id"
+          ] || ""
+        ).trim();
+
+      const transmissionSig =
+        String(
+          req.headers[
+            "paypal-transmission-sig"
+          ] || ""
+        ).trim();
+
+      const transmissionTime =
+        String(
+          req.headers[
+            "paypal-transmission-time"
+          ] || ""
+        ).trim();
+
+      if (
+        !authAlgo ||
+        !certUrl ||
+        !transmissionId ||
+        !transmissionSig ||
+        !transmissionTime
+      ) {
+        return res.status(400).json({
+          error:
+            "Missing PayPal webhook signature headers",
+        });
+      }
+
+      const accessToken =
+        await getAccessToken();
+
+      const verificationResponse =
+        await axios.post(
+          `${PAYPAL_BASE_URL}/v1/notifications/verify-webhook-signature`,
+          {
+            auth_algo:
+              authAlgo,
+
+            cert_url:
+              certUrl,
+
+            transmission_id:
+              transmissionId,
+
+            transmission_sig:
+              transmissionSig,
+
+            transmission_time:
+              transmissionTime,
+
+            webhook_id:
+              webhookId,
+
+            webhook_event:
+              event,
+          },
+          {
+            headers: {
+              Authorization:
+                `Bearer ${accessToken}`,
+
+              "Content-Type":
+                "application/json",
+            },
+
+            timeout: 30000,
+          }
+        );
+
+      const verificationStatus =
+        String(
+          verificationResponse.data
+            ?.verification_status ||
+            ""
+        )
+          .trim()
+          .toUpperCase();
+
+      if (
+        verificationStatus !==
+        "SUCCESS"
+      ) {
+        console.log(
+          "❌ INVALID PAYPAL WEBHOOK SIGNATURE:",
+          verificationStatus
+        );
+
+        return res.status(400).json({
+          error:
+            "Invalid PayPal webhook signature",
+        });
+      }
+
+      console.log(
+        "✅ PAYPAL WEBHOOK VERIFIED:",
+        {
+          event_id:
+            event.id || null,
+
+          event_type:
+            event.event_type || null,
+
+          resource_id:
+            event.resource?.id ||
+            null,
+        }
+      );
+
+      return res.status(200).json({
+        received: true,
+      });
+    } catch (error) {
+      console.log(
+        "❌ PAYPAL WEBHOOK ERROR:",
+        error.response?.data ||
+          error.message
+      );
+
+      return res.status(500).json({
+        error:
+          "PayPal webhook processing failed",
+      });
+    }
+  }
+);
+
+app.use(bodyParser.json());
 
 app.post(
   "/google-play-rtdn",
