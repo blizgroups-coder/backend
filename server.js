@@ -2337,7 +2337,18 @@ app.post(
       const accessToken =
         await getAccessToken();
 
-      const trustedMetadata = {
+      const publicBaseUrl =
+        paymentPublicBaseUrl(req);
+
+      const paypalReturnUrl =
+        `${publicBaseUrl}/paypal-return?user_id=${encodeURIComponent(
+         user_id
+      )}`;
+
+      const paypalCancelUrl =
+        `${publicBaseUrl}/paypal-cancel`;
+
+     const trustedMetadata = {
         user_id,
 
         plan:
@@ -2386,10 +2397,10 @@ app.post(
               "PAY_NOW",
 
             return_url:
-              "tunevora://success",
+              paypalReturnUrl,
 
             cancel_url:
-              "tunevora://cancel",
+              paypalCancelUrl,
           },
         },
         {
@@ -2530,30 +2541,30 @@ app.post(
         });
       }
 
-      const accessToken =
-        await getAccessToken();
+     const accessToken =
+  await getAccessToken();
 
-      const capture =
-        await axios.post(
-          `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
-            orderID
-          )}/capture`,
-          {},
-          {
-            headers: {
-              Authorization:
-                `Bearer ${accessToken}`,
+const capture =
+  await axios.post(
+    `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+      orderID
+    )}/capture`,
+    {},
+    {
+      headers: {
+        Authorization:
+          `Bearer ${accessToken}`,
 
-              "Content-Type":
-                "application/json",
+        "Content-Type":
+          "application/json",
 
-              Prefer:
-                "return=representation",
-            },
+        Prefer:
+          "return=representation",
+      },
 
-            timeout: 30000,
-          }
-        );
+      timeout: 30000,
+    }
+  );
 
       if (
         capture.data.status !==
@@ -2891,6 +2902,255 @@ app.post(
           "Capture failed",
       });
     }
+  }
+);
+
+/* ===================================================== */
+/* 🌐 PAYPAL SUBSCRIPTION RETURN                        */
+/* ===================================================== */
+
+app.get(
+  "/paypal-return",
+  (req, res) => {
+    console.log("🌐 PAYPAL RETURN HIT");
+
+    const userId =
+      String(
+        req.query.user_id || ""
+      ).trim();
+
+    const validUserId =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+        .test(userId);
+
+    if (!validUserId) {
+      return res
+        .status(400)
+        .send(
+          "Invalid Tunevora payment return."
+        );
+    }
+
+    res
+      .status(200)
+      .type("html")
+      .send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+<title>Tunevora PayPal Payment</title>
+
+<style>
+body{
+  margin:0;
+  background:#08080a;
+  color:white;
+  font-family:Arial,sans-serif;
+  display:grid;
+  place-items:center;
+  min-height:100vh;
+}
+
+main{
+  max-width:520px;
+  margin:24px;
+  padding:36px;
+  border-radius:28px;
+  background:#17171c;
+  text-align:center;
+}
+
+.status{
+  color:#aaa;
+  line-height:1.6;
+}
+</style>
+</head>
+
+<body>
+
+<main>
+  <h1 id="title">
+    Confirming payment...
+  </h1>
+
+  <p
+    id="status"
+    class="status"
+  >
+    Please keep this page open.
+  </p>
+
+  <p>
+    <a
+      id="returnButton"
+      href="https://tunevora.com"
+      style="
+        display:none;
+        color:white;
+      "
+    >
+      Return to Tunevora
+    </a>
+  </p>
+</main>
+
+<script>
+(async function () {
+
+  const params =
+    new URLSearchParams(
+      window.location.search
+    );
+
+  const orderID =
+    String(
+      params.get("token") || ""
+    ).trim();
+
+  const userId =
+    ${JSON.stringify(userId)};
+
+  const title =
+    document.getElementById(
+      "title"
+    );
+
+  const status =
+    document.getElementById(
+      "status"
+    );
+
+  const returnButton =
+    document.getElementById(
+      "returnButton"
+    );
+
+  if (!orderID) {
+    title.textContent =
+      "Payment confirmation failed";
+
+    status.textContent =
+      "PayPal did not return an order reference.";
+
+    returnButton.style.display =
+      "inline-block";
+
+    return;
+  }
+
+  try {
+
+    const response =
+      await fetch(
+        "/capture-order",
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
+
+          body:
+            JSON.stringify({
+              orderID:
+                orderID,
+
+              user_id:
+                userId,
+            }),
+        }
+      );
+
+    const data =
+      await response.json();
+
+    if (
+      !response.ok ||
+      data.success !== true
+    ) {
+      throw new Error(
+        data.error ||
+        "Payment confirmation failed"
+      );
+    }
+
+    title.textContent =
+      "Payment completed ✓";
+
+    status.textContent =
+      data.message ||
+      "Your Tunevora subscription is active.";
+
+    returnButton.style.display =
+      "inline-block";
+
+  } catch (error) {
+
+    title.textContent =
+      "Payment confirmation needs attention";
+
+    status.textContent =
+      error.message ||
+      "Could not confirm payment.";
+
+    returnButton.style.display =
+      "inline-block";
+  }
+
+})();
+</script>
+
+</body>
+</html>`);
+  }
+);
+
+app.get(
+  "/paypal-cancel",
+  (req, res) => {
+    console.log("🌐 PAYPAL CANCEL HIT");
+
+    res
+      .status(200)
+      .type("html")
+      .send(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+<title>Payment Cancelled</title>
+</head>
+
+<body
+style="
+background:#08080a;
+color:white;
+font-family:Arial;
+text-align:center;
+padding-top:100px;
+"
+>
+
+<h1>Payment cancelled</h1>
+
+<p>
+No PayPal payment was completed.
+</p>
+
+<a
+href="https://tunevora.com"
+style="color:white;"
+>
+Return to Tunevora
+</a>
+
+</body>
+</html>`);
   }
 );
 
