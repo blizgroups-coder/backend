@@ -1721,6 +1721,33 @@ const PAYPAL_BASE_URL = String(
     "https://api-m.sandbox.paypal.com"
 ).replace(/\/+$/, "");
 
+const PAYPAL_SUPPORTED_CURRENCIES = new Set([
+  "AUD",
+  "BRL",
+  "CAD",
+  "CNY",
+  "CZK",
+  "DKK",
+  "EUR",
+  "HKD",
+  "HUF",
+  "ILS",
+  "JPY",
+  "MYR",
+  "MXN",
+  "TWD",
+  "NZD",
+  "NOK",
+  "PHP",
+  "PLN",
+  "GBP",
+  "SGD",
+  "SEK",
+  "CHF",
+  "THB",
+  "USD",
+]);
+
 const ALLOWED_SUBSCRIPTION_PLANS = [
   "standard",
   "premium",
@@ -1851,6 +1878,59 @@ async function loadSubscriptionPrice(
 }
 
 /* ===================================================== */
+/* 💵 LOAD PAYPAL-SAFE SUBSCRIPTION PRICE                */
+/* ===================================================== */
+
+async function loadPayPalSubscriptionPrice(
+  plan,
+  country
+) {
+  const localPricing =
+    await loadSubscriptionPrice(
+      plan,
+      country
+    );
+
+  if (
+    PAYPAL_SUPPORTED_CURRENCIES.has(
+      localPricing.currency
+    )
+  ) {
+    return localPricing;
+  }
+
+  const usdPricing =
+    await loadSubscriptionPrice(
+      plan,
+      "US"
+    );
+
+  if (usdPricing.currency !== "USD") {
+    throw new Error(
+      "Tunevora US PayPal fallback price must use USD"
+    );
+  }
+
+  console.log(
+    "ℹ️ PAYPAL CURRENCY FALLBACK:",
+    {
+      requested_country:
+        String(country || "").toUpperCase(),
+      local_amount:
+        localPricing.amount,
+      local_currency:
+        localPricing.currency,
+      paypal_amount:
+        usdPricing.amount,
+      paypal_currency:
+        usdPricing.currency,
+    }
+  );
+
+  return usdPricing;
+}
+
+/* ===================================================== */
 /* 🔑 GET PAYPAL TOKEN                                   */
 /* ===================================================== */
 
@@ -1934,7 +2014,7 @@ app.post(
       }
 
       const pricing =
-        await loadSubscriptionPrice(
+        await loadPayPalSubscriptionPrice(
           plan,
           country
         );
@@ -2245,7 +2325,7 @@ app.post(
       }
 
       const expectedPricing =
-        await loadSubscriptionPrice(
+        await loadPayPalSubscriptionPrice(
           selectedPlan,
           metadataCountry
         );
