@@ -2045,8 +2045,13 @@ app.post(
     } catch (error) {
       console.log(
         "❌ CREATE PAYPAL ERROR:",
-        error.response?.data?.name ||
-          error.message
+        JSON.stringify(
+          error.response?.data || {
+            message: error.message,
+          },
+          null,
+          2
+        )
       );
 
       return res.status(500).json({
