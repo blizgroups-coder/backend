@@ -1682,9 +1682,94 @@ app.post(
         }
       );
 
-      return res.status(200).json({
-        received: true,
-      });
+      const eventType =
+  String(
+    event.event_type || ""
+  ).trim();
+
+/*
+ * Buyer approved the PayPal order.
+ * Capture + finalize subscription
+ * even if the browser never returns.
+ */
+if (
+  eventType ===
+  "CHECKOUT.ORDER.APPROVED"
+) {
+  const orderID =
+    String(
+      event.resource?.id || ""
+    ).trim();
+
+  if (!orderID) {
+    throw new Error(
+      "PayPal approved-order webhook did not include an order ID"
+    );
+  }
+
+  const result =
+    await finalizePayPalSubscriptionOrderFromWebhook(
+      orderID
+    );
+
+  return res.status(200).json({
+    received: true,
+    event_type:
+      eventType,
+    ...result,
+  });
+}
+
+/*
+ * Capture completed event.
+ * Reconcile/finalize if the
+ * approved-order event was missed.
+ */
+if (
+  eventType ===
+  "PAYMENT.CAPTURE.COMPLETED"
+) {
+  const orderID =
+    String(
+      event.resource
+        ?.supplementary_data
+        ?.related_ids
+        ?.order_id || ""
+    ).trim();
+
+  if (!orderID) {
+    console.log(
+      "⚠️ PAYPAL CAPTURE WEBHOOK MISSING ORDER ID:",
+      event.id || null
+    );
+
+    return res.status(200).json({
+      received: true,
+      ignored: true,
+    });
+  }
+
+  const result =
+    await finalizePayPalSubscriptionOrderFromWebhook(
+      orderID
+    );
+
+  return res.status(200).json({
+    received: true,
+    event_type:
+      eventType,
+    ...result,
+  });
+}
+
+/*
+ * Ignore any other verified
+ * PayPal event safely.
+ */
+return res.status(200).json({
+  received: true,
+  ignored: true,
+});
     } catch (error) {
       console.log(
         "❌ PAYPAL WEBHOOK ERROR:",
@@ -2606,6 +2691,406 @@ function verifyPayPalReturnState(state) {
   }
 
   return userId;
+}
+
+/* ===================================================== */
+/* 🔄 PAYPAL WEBHOOK SUBSCRIPTION FINALIZER              */
+/* ===================================================== */
+
+async function finalizePayPalSubscriptionOrderFromWebhook(
+  orderID
+) {
+  const normalizedOrderID =
+    String(orderID || "").trim();
+
+  if (!normalizedOrderID) {
+    throw new Error(
+      "Missing PayPal order ID"
+    );
+  }
+
+  /*
+   * Already finalized?
+   */
+  const existingPayment =
+    await findPaymentByReference(
+      normalizedOrderID
+    );
+
+  if (existingPayment) {
+    return {
+      success: true,
+      duplicate: true,
+      user_id:
+        existingPayment.user_id,
+      plan:
+        existingPayment.plan,
+      amount:
+        Number(existingPayment.amount),
+      currency:
+        existingPayment.currency,
+      transaction_reference:
+        normalizedOrderID,
+    };
+  }
+
+  const accessToken =
+    await getAccessToken();
+
+  /*
+   * Load trusted PayPal order.
+   */
+  const orderLookup =
+    await axios.get(
+      `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+        normalizedOrderID
+      )}`,
+      {
+        headers: {
+          Authorization:
+            `Bearer ${accessToken}`,
+
+          "Content-Type":
+            "application/json",
+        },
+
+        timeout: 30000,
+      }
+    );
+
+  const orderData =
+    orderLookup.data || {};
+
+  const purchaseUnit =
+    orderData.purchase_units?.[0];
+
+  let metadata = {};
+
+  try {
+    metadata = JSON.parse(
+      purchaseUnit?.custom_id || "{}"
+    );
+  } catch (_) {
+    metadata = {};
+  }
+ 
+  const paymentType =
+  String(
+    metadata.payment_type ||
+      PAYMENT_TYPES.SUBSCRIPTION
+  )
+    .trim()
+    .toLowerCase();
+
+/*
+ * Ticket and advertisement PayPal
+ * orders use their own capture flows.
+ * This helper handles subscriptions only.
+ */
+if (
+  paymentType !==
+  PAYMENT_TYPES.SUBSCRIPTION
+) {
+  console.log(
+    "ℹ️ PAYPAL WEBHOOK NON-SUBSCRIPTION ORDER IGNORED:",
+    {
+      order_id:
+        normalizedOrderID,
+      payment_type:
+        paymentType,
+    }
+  );
+
+  return {
+    success: true,
+    ignored: true,
+    payment_type:
+      paymentType,
+    transaction_reference:
+      normalizedOrderID,
+  };
+}
+
+  const userId =
+    String(
+      metadata.user_id || ""
+    ).trim();
+
+  const selectedPlan =
+    String(
+      metadata.plan || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const expectedAmount =
+    Number(metadata.amount);
+
+  const expectedCurrency =
+    String(
+      metadata.currency || ""
+    )
+      .trim()
+      .toUpperCase();
+
+  const validUserId =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      .test(userId);
+
+  if (!validUserId) {
+    throw new Error(
+      "Invalid PayPal order user"
+    );
+  }
+
+  if (
+    !ALLOWED_SUBSCRIPTION_PLANS.includes(
+      selectedPlan
+    )
+  ) {
+    throw new Error(
+      "Invalid PayPal subscription plan"
+    );
+  }
+
+  if (
+    !Number.isFinite(expectedAmount) ||
+    expectedAmount <= 0 ||
+    !/^[A-Z]{3}$/.test(
+      expectedCurrency
+    )
+  ) {
+    throw new Error(
+      "Invalid PayPal order pricing metadata"
+    );
+  }
+
+  const orderAmount =
+    Number(
+      purchaseUnit?.amount?.value
+    );
+
+  const orderCurrency =
+    String(
+      purchaseUnit?.amount
+        ?.currency_code || ""
+    )
+      .trim()
+      .toUpperCase();
+
+  if (
+    !Number.isFinite(orderAmount) ||
+    !amountsMatch(
+      orderAmount,
+      expectedAmount
+    ) ||
+    orderCurrency !==
+      expectedCurrency
+  ) {
+    throw new Error(
+      "PayPal order amount or currency verification failed"
+    );
+  }
+
+  const orderStatus =
+    String(
+      orderData.status || ""
+    )
+      .trim()
+      .toUpperCase();
+
+  let captureResponse;
+
+  if (orderStatus === "COMPLETED") {
+    captureResponse = {
+      data: orderData,
+    };
+  } else if (
+    orderStatus === "APPROVED"
+  ) {
+    try {
+      captureResponse =
+        await capturePayPalOrder(
+          normalizedOrderID
+        );
+    } catch (captureError) {
+      /*
+       * Hosted return and webhook may
+       * attempt capture at the same time.
+       * Check whether the other request
+       * already completed it.
+       */
+      const recoveryLookup =
+        await axios.get(
+          `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(
+            normalizedOrderID
+          )}`,
+          {
+            headers: {
+              Authorization:
+                `Bearer ${accessToken}`,
+
+              "Content-Type":
+                "application/json",
+            },
+
+            timeout: 30000,
+          }
+        );
+
+      const recoveryStatus =
+        String(
+          recoveryLookup.data?.status ||
+            ""
+        )
+          .trim()
+          .toUpperCase();
+
+      if (
+        recoveryStatus !== "COMPLETED"
+      ) {
+        throw captureError;
+      }
+
+      captureResponse = {
+        data:
+          recoveryLookup.data,
+      };
+    }
+  } else {
+    throw new Error(
+      `PayPal order is not ready for capture: ${
+        orderStatus || "UNKNOWN"
+      }`
+    );
+  }
+
+  const captured =
+    paypalCaptureData(
+      captureResponse
+    );
+
+  if (
+    captured.status !== "COMPLETED"
+  ) {
+    throw new Error(
+      "PayPal payment was not completed"
+    );
+  }
+
+  const capturedUserId =
+    String(
+      captured.metadata.user_id || ""
+    ).trim();
+
+  const capturedPlan =
+    String(
+      captured.metadata.plan || ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (
+    capturedUserId !== userId ||
+    capturedPlan !== selectedPlan
+  ) {
+    throw new Error(
+      "PayPal captured metadata verification failed"
+    );
+  }
+
+  if (
+    !Number.isFinite(
+      captured.amount
+    ) ||
+    captured.amount <= 0 ||
+    !amountsMatch(
+      captured.amount,
+      expectedAmount
+    ) ||
+    captured.currency !==
+      expectedCurrency
+  ) {
+    throw new Error(
+      "PayPal captured amount or currency verification failed"
+    );
+  }
+
+  const {
+    data: finalizeResult,
+    error: finalizeError,
+  } = await supabase.rpc(
+    "finalize_paypal_subscription",
+    {
+      p_user_id:
+        userId,
+
+      p_plan:
+        selectedPlan,
+
+      p_amount:
+        captured.amount,
+
+      p_currency:
+        captured.currency,
+
+      p_transaction_reference:
+        normalizedOrderID,
+    }
+  );
+
+  if (finalizeError) {
+    throw finalizeError;
+  }
+
+  const finalized =
+    finalizeResult || {};
+
+  console.log(
+    finalized.duplicate === true
+      ? "✅ PAYPAL WEBHOOK ALREADY FINALIZED:"
+      : "✅ PAYPAL WEBHOOK ACTIVATED:",
+    {
+      order_id:
+        normalizedOrderID,
+      user_id:
+        userId,
+      plan:
+        selectedPlan,
+    }
+  );
+
+  return {
+    success: true,
+
+    duplicate:
+      finalized.duplicate === true,
+
+    user_id:
+      userId,
+
+    plan:
+      finalized.plan ||
+      selectedPlan,
+
+    amount:
+      Number(
+        finalized.amount ??
+          captured.amount
+      ),
+
+    currency:
+      finalized.currency ||
+      captured.currency,
+
+    transaction_reference:
+      finalized.transaction_reference ||
+      normalizedOrderID,
+
+    premium_until:
+      finalized.premium_until ||
+      null,
+  };
 }
 
 /* ===================================================== */
