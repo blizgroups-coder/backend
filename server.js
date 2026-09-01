@@ -126,8 +126,9 @@ const APPLE_IAP_ISSUER_ID = String(
 
 const APPLE_IAP_PRIVATE_KEY = String(
   process.env.APPLE_IAP_PRIVATE_KEY || ""
-).replace(/\n/g, "
-").trim();
+)
+  .replace(/\\n/g, "\n")
+  .trim();
 
 const APPLE_IAP_STANDARD_PRODUCT_ID = String(
   process.env.APPLE_IAP_STANDARD_PRODUCT_ID || "standard_monthly"
