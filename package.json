@@ -11,6 +11,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@apple/app-store-server-library": "^3.1.0",
     "@supabase/supabase-js": "^2.104.0",
     "axios": "^1.15.2",
     "body-parser": "^2.2.2",

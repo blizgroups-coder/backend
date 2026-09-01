@@ -5,6 +5,10 @@ const { createClient } = require("@supabase/supabase-js");
 const Stripe = require("stripe");
 const crypto = require("crypto");
 const { google } = require("googleapis");
+const {
+  AppStoreServerAPIClient,
+  Environment: AppleEnvironment,
+} = require("@apple/app-store-server-library");
 
 const stripe = new Stripe(
   process.env.STRIPE_SECRET_KEY
@@ -103,6 +107,110 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+/* ===================================================== */
+/* 🍎 APPLE IN-APP PURCHASE CONFIGURATION                */
+/* ===================================================== */
+
+const APPLE_IAP_BUNDLE_ID = String(
+  process.env.APPLE_IAP_BUNDLE_ID || "com.tunevora.music"
+).trim();
+
+const APPLE_IAP_KEY_ID = String(
+  process.env.APPLE_IAP_KEY_ID || ""
+).trim();
+
+const APPLE_IAP_ISSUER_ID = String(
+  process.env.APPLE_IAP_ISSUER_ID || ""
+).trim();
+
+const APPLE_IAP_PRIVATE_KEY = String(
+  process.env.APPLE_IAP_PRIVATE_KEY || ""
+).replace(/\n/g, "
+").trim();
+
+const APPLE_IAP_STANDARD_PRODUCT_ID = String(
+  process.env.APPLE_IAP_STANDARD_PRODUCT_ID || "standard_monthly"
+).trim();
+
+const APPLE_IAP_PREMIUM_PRODUCT_ID = String(
+  process.env.APPLE_IAP_PREMIUM_PRODUCT_ID || "premium_monthly"
+).trim();
+
+const APPLE_IAP_PRODUCT_TO_PLAN = new Map([
+  [APPLE_IAP_STANDARD_PRODUCT_ID, "standard"],
+  [APPLE_IAP_PREMIUM_PRODUCT_ID, "premium"],
+]);
+
+function requireAppleIapConfiguration() {
+  if (!APPLE_IAP_KEY_ID || !APPLE_IAP_ISSUER_ID || !APPLE_IAP_PRIVATE_KEY) {
+    const error = new Error(
+      "Apple In-App Purchase server credentials are not configured"
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+}
+
+function createAppleApiClient(environment) {
+  requireAppleIapConfiguration();
+
+  return new AppStoreServerAPIClient(
+    APPLE_IAP_PRIVATE_KEY,
+    APPLE_IAP_KEY_ID,
+    APPLE_IAP_ISSUER_ID,
+    APPLE_IAP_BUNDLE_ID,
+    environment
+  );
+}
+
+function decodeAppleJwsPayload(jws) {
+  const parts = String(jws || "").split(".");
+  if (parts.length !== 3) {
+    throw new Error("Apple returned invalid signed transaction data");
+  }
+
+  const payload = Buffer.from(parts[1], "base64url").toString("utf8");
+  return JSON.parse(payload);
+}
+
+async function loadAppleTransactionInfo(transactionId) {
+  const environments = [
+    AppleEnvironment.PRODUCTION,
+    AppleEnvironment.SANDBOX,
+  ];
+
+  let lastError = null;
+
+  for (const environment of environments) {
+    try {
+      const client = createAppleApiClient(environment);
+      const response = await client.getTransactionInfo(transactionId);
+      const signedTransactionInfo = String(
+        response?.signedTransactionInfo || ""
+      ).trim();
+
+      if (!signedTransactionInfo) {
+        throw new Error("Apple did not return signed transaction information");
+      }
+
+      return {
+        environment,
+        transaction: decodeAppleJwsPayload(signedTransactionInfo),
+      };
+    } catch (error) {
+      lastError = error;
+      const status = Number(error?.httpStatusCode || error?.statusCode || 0);
+      if (status !== 404) throw error;
+    }
+  }
+
+  throw lastError || new Error("Apple transaction was not found");
+}
+
+function appleTransactionReference(transactionId) {
+  return `apple:${String(transactionId).trim()}`;
+}
 
 /* ===================================================== */
 /* 🤖 GOOGLE PLAY BILLING CONFIGURATION                  */
@@ -5578,6 +5686,190 @@ app.post(
   }
 );
 
+
+/* ===================================================== */
+/* 🍎 VERIFY APPLE NON-RENEWING SUBSCRIPTION             */
+/* ===================================================== */
+
+app.post(
+  "/verify-apple-purchase",
+  async (req, res) => {
+    try {
+      const authenticatedUser =
+        await authenticateSupabaseRequest(req);
+
+      const productId = String(req.body?.product_id || "").trim();
+      const transactionId = String(req.body?.transaction_id || "").trim();
+
+      if (!productId || !transactionId) {
+        return res.status(400).json({
+          error: "Missing product_id or transaction_id",
+        });
+      }
+
+      const plan = APPLE_IAP_PRODUCT_TO_PLAN.get(productId);
+      if (!plan) {
+        return res.status(400).json({
+          error: "Unsupported Apple In-App Purchase product",
+        });
+      }
+
+      await loadProfile(authenticatedUser.id);
+
+      const appleLookup = await loadAppleTransactionInfo(transactionId);
+      const transaction = appleLookup.transaction || {};
+
+      if (String(transaction.transactionId || "").trim() !== transactionId) {
+        return res.status(400).json({error: "Apple transaction ID verification failed"});
+      }
+
+      if (String(transaction.productId || "").trim() !== productId) {
+        return res.status(400).json({error: "Apple product verification failed"});
+      }
+
+      if (String(transaction.bundleId || "").trim() !== APPLE_IAP_BUNDLE_ID) {
+        return res.status(400).json({error: "Apple bundle ID verification failed"});
+      }
+
+      if (transaction.revocationDate != null) {
+        return res.status(409).json({
+          error: "This Apple purchase has been revoked or refunded",
+        });
+      }
+
+      const appAccountToken = String(transaction.appAccountToken || "").trim();
+      if (
+        appAccountToken &&
+        appAccountToken.toLowerCase() !== String(authenticatedUser.id).toLowerCase()
+      ) {
+        return res.status(403).json({
+          error: "Apple purchase belongs to another Tunevora account",
+        });
+      }
+
+      const transactionReference = appleTransactionReference(transactionId);
+
+      const {data: existingPayment, error: existingPaymentError} = await supabase
+        .from("payments")
+        .select("id, user_id")
+        .eq("transaction_reference", transactionReference)
+        .maybeSingle();
+
+      if (existingPaymentError) throw existingPaymentError;
+
+      if (
+        existingPayment &&
+        String(existingPayment.user_id) !== String(authenticatedUser.id)
+      ) {
+        return res.status(403).json({
+          error: "Apple transaction is already linked to another user",
+        });
+      }
+
+      if (existingPayment) {
+        const {data: duplicateProfile, error: duplicateProfileError} = await supabase
+          .from("profiles")
+          .select("plan, premium_until")
+          .eq("id", authenticatedUser.id)
+          .single();
+
+        if (duplicateProfileError) throw duplicateProfileError;
+
+        return res.json({
+          success: true,
+          duplicate: true,
+          plan: duplicateProfile.plan || plan,
+          product_id: productId,
+          transaction_id: transactionId,
+          premium_until: duplicateProfile.premium_until,
+          environment: transaction.environment || null,
+        });
+      }
+
+      const {data: currentProfile, error: currentProfileError} = await supabase
+        .from("profiles")
+        .select("premium_until")
+        .eq("id", authenticatedUser.id)
+        .single();
+
+      if (currentProfileError) throw currentProfileError;
+
+      const currentExpiryMs = Date.parse(currentProfile?.premium_until || "");
+      const extensionBaseMs =
+        Number.isFinite(currentExpiryMs) && currentExpiryMs > Date.now()
+          ? currentExpiryMs
+          : Date.now();
+
+      const premiumUntil = new Date(
+        extensionBaseMs + 30 * 24 * 60 * 60 * 1000
+      );
+
+      const amount = Number.isFinite(Number(transaction.price))
+        ? Number(transaction.price) / 1000
+        : 0;
+
+      const rawCurrency = String(transaction.currency || "AED").trim().toUpperCase();
+      const currency = /^[A-Z]{3}$/.test(rawCurrency) ? rawCurrency : "AED";
+
+      const {error: profileError} = await supabase
+        .from("profiles")
+        .update({
+          is_premium: true,
+          plan,
+          premium_until: premiumUntil.toISOString(),
+        })
+        .eq("id", authenticatedUser.id);
+
+      if (profileError) throw profileError;
+
+      const {error: paymentError} = await supabase
+        .from("payments")
+        .insert({
+          user_id: authenticatedUser.id,
+          plan,
+          amount,
+          currency,
+          status: "completed",
+          payment_method: "Apple In-App Purchase",
+          transaction_reference: transactionReference,
+        });
+
+      if (paymentError && paymentError.code !== "23505") throw paymentError;
+
+      const {error: subscriptionError} = await supabase
+        .from("subscriptions")
+        .insert({
+          user_id: authenticatedUser.id,
+          plan,
+          status: "active",
+          amount,
+          currency,
+          expires_at: premiumUntil.toISOString(),
+        });
+
+      if (subscriptionError) throw subscriptionError;
+
+      return res.json({
+        success: true,
+        duplicate: false,
+        plan,
+        product_id: productId,
+        transaction_id: transactionId,
+        premium_until: premiumUntil.toISOString(),
+        environment: transaction.environment || null,
+      });
+    } catch (error) {
+      const rawStatus = Number(error?.statusCode || error?.httpStatusCode || 500);
+      const statusCode = rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500;
+
+      console.log("❌ APPLE IAP VERIFICATION ERROR:", error);
+
+      return res.status(statusCode).json({
+        error: error.message || "Apple In-App Purchase verification failed",
+      });
+    }
+  }
+);
 
 /* ===================================================== */
 /* 🤖 VERIFY GOOGLE PLAY SUBSCRIPTION                    */
