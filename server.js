@@ -10,11 +10,16 @@ const {
   Environment: AppleEnvironment,
 } = require("@apple/app-store-server-library");
 
-const stripe = new Stripe(
-  process.env.STRIPE_SECRET_KEY
-);
+const { configureLocalAdsReview } = require("./local/ads_review.cjs");
+const localAdsReview = configureLocalAdsReview(process.env);
+const stripe = localAdsReview
+  ? (localAdsReview.stripeKey ? new Stripe(localAdsReview.stripeKey) : null)
+  : new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
+if (localAdsReview) {
+  app.use(localAdsReview.requestGuard);
+}
 
 /* ===================================================== */
 /* 🌐 CORS - TUNEVORA WEB                               */
@@ -1562,6 +1567,10 @@ app.post(
       );
     }
 
+    if (localAdsReview && !localAdsReview.acceptsWebhook(event)) {
+      return res.json({ received: true, ignored: true });
+    }
+
     try {
       console.log(
         "🔥 STRIPE WEBHOOK EVENT:",
@@ -1894,6 +1903,9 @@ return res.status(200).json({
 );
 
 app.use(bodyParser.json());
+if (localAdsReview) {
+  app.use(localAdsReview.bodyGuard);
+}
 
 app.post(
   "/google-play-rtdn",
@@ -6643,7 +6655,8 @@ app.get("/", (req, res) => {
 const PORT =
   process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+const listenArguments = localAdsReview ? [PORT, "127.0.0.1"] : [PORT];
+app.listen(...listenArguments, () => {
   console.log(
     `🚀 Server running on port ${PORT}`
   );
