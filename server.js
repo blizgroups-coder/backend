@@ -1197,8 +1197,7 @@ async function ticketPricing(ticket) {
   return {
     ticketPrice,
     platformFee,
-    artistAmount,
-    commissionRate,
+    artistAmount,    commissionRate,
     total: ticketPrice,
     currency,
   };
@@ -2398,7 +2397,6 @@ async function loadSubscriptionPrice(
 /* ===================================================== */
 /* 💱 PAYPAL FX CONVERSION + DAILY CACHE                 */
 /* ===================================================== */
-
 const FX_CACHE_MAX_AGE_MS =
   24 * 60 * 60 * 1000;
 
@@ -3597,8 +3595,7 @@ app.post(
     } else {
       user_id =
         verifyPayPalReturnState(
-          paypalState
-       );
+          paypalState       );
     }
 
       /*
@@ -4734,6 +4731,227 @@ app.post(
 /* ===================================================== */
 
 app.post(
+  "/reserve-event-ticket",
+  async (req, res) => {
+    try {
+      const {
+        user_id,
+        event_id,
+        ticket_type_id,
+      } = req.body || {};
+
+      if (!event_id) {
+        return res.status(400).json({
+          error: "Missing event_id",
+        });
+      }
+
+      const authenticatedTicketUserId =
+        await authenticateTicketPaymentRequest(
+          req,
+          user_id
+        );
+
+      if (ticket_type_id) {
+        const {
+          data: ticket,
+          error,
+        } = await supabase.rpc(
+          "reserve_event_ticket",
+          {
+            p_user_id:
+              authenticatedTicketUserId,
+            p_event_id:
+              String(event_id),
+            p_ticket_type_id:
+              String(ticket_type_id),
+          }
+        );
+
+        if (error) {
+          throw error;
+        }
+
+        return res.json({
+          success: true,
+          ticket,
+        });
+      }
+
+      /*
+       * Legacy single-price event compatibility.
+       *
+       * Existing Tunevora events can still have a trusted
+       * artist_events.ticket_price without ticket tiers.
+       * The server creates the pending ticket using the
+       * database event price. The Flutter client never
+       * supplies authoritative price, fee, or artist share.
+       */
+      const {
+        data: event,
+        error: eventError,
+      } = await supabase
+        .from("artist_events")
+        .select(`
+          id,
+          artist_id,
+          title,
+          venue,
+          event_date,
+          ticket_price,
+          currency,
+          ticket_prefix,
+          is_cancelled
+        `)
+        .eq("id", event_id)
+        .maybeSingle();
+
+      if (eventError) {
+        throw eventError;
+      }
+
+      if (!event) {
+        return res.status(404).json({
+          error: "Event was not found",
+        });
+      }
+
+      if (event.is_cancelled === true) {
+        return res.status(409).json({
+          error: "This event has been cancelled",
+        });
+      }
+
+      const ticketPrice =
+        Number(event.ticket_price);
+
+      if (
+        !Number.isFinite(ticketPrice) ||
+        ticketPrice <= 0
+      ) {
+        return res.status(409).json({
+          error: "Ticket price is invalid",
+        });
+      }
+
+      const currency =
+        normalizeCurrency(
+          event.currency || "USD"
+        );
+
+      const commissionRate = 0.10;
+      const platformFee =
+        Math.round(
+          ticketPrice *
+          commissionRate *
+          100
+        ) / 100;
+      const artistAmount =
+        Math.round(
+          (
+            ticketPrice -
+            platformFee
+          ) * 100
+        ) / 100;
+
+      const prefix = String(
+        event.ticket_prefix ||
+        "TUNEVORA"
+      )
+        .trim()
+        .replace(
+          /[^A-Za-z0-9_-]/g,
+          ""
+        )
+        .slice(0, 24) ||
+        "TUNEVORA";
+
+      const ticketCode =
+        `${prefix}-${crypto
+          .randomBytes(10)
+          .toString("hex")
+          .toUpperCase()}`;
+
+      const {
+        data: ticket,
+        error: insertError,
+      } = await supabase
+        .from("event_tickets")
+        .insert({
+          event_id: event.id,
+          user_id:
+            authenticatedTicketUserId,
+          artist_id: event.artist_id,
+          ticket_price:
+            ticketPrice,
+          unit_price:
+            ticketPrice,
+          platform_fee:
+            platformFee,
+          artist_amount:
+            artistAmount,
+          commission_rate:
+            commissionRate,
+          payment_status:
+            "pending",
+          status:
+            "pending",
+          ticket_code:
+            ticketCode,
+          qr_data:
+            ticketCode,
+          is_used:
+            false,
+          currency,
+          event_title:
+            event.title,
+          venue:
+            event.venue,
+          event_date:
+            event.event_date,
+          reservation_expires_at:
+            new Date(
+              Date.now() +
+              15 * 60 * 1000
+            ).toISOString(),
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        throw insertError;
+      }
+
+      return res.json({
+        success: true,
+        ticket,
+      });
+    } catch (error) {
+      console.log(
+        "❌ RESERVE EVENT TICKET ERROR:",
+        error
+      );
+
+      const statusCode =
+        Number(error.statusCode) >= 400 &&
+        Number(error.statusCode) < 600
+          ? Number(error.statusCode)
+          : 500;
+
+      return res.status(statusCode).json({
+        error:
+          error.message ||
+          "Could not reserve event ticket",
+      });
+    }
+  }
+);
+
+/* ===================================================== */
+/* 🎫 CREATE STRIPE TICKET PAYMENT INTENT                */
+/* ===================================================== */
+
+app.post(
   "/create-ticket-payment-intent",
   async (req, res) => {
     try {
@@ -4797,8 +5015,7 @@ app.post(
               PAYMENT_TYPES.EVENT_TICKET,
             user_id:
               authenticatedTicketUserId,
-            reference_id:
-              String(ticket.id),
+            reference_id:              String(ticket.id),
             ticket_id:
               String(ticket.id),
           },
@@ -5997,8 +6214,7 @@ app.post(
         success: true,
         duplicate: false,
         plan,
-        product_id: productId,
-        transaction_id: transactionId,
+        product_id: productId,        transaction_id: transactionId,
         premium_until: premiumUntil.toISOString(),
         environment: transaction.environment || null,
       });
