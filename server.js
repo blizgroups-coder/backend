@@ -10,11 +10,16 @@ const {
   Environment: AppleEnvironment,
 } = require("@apple/app-store-server-library");
 
-const stripe = new Stripe(
-  process.env.STRIPE_SECRET_KEY
-);
+const { configureLocalAdsReview } = require("./local/ads_review.cjs");
+const localAdsReview = configureLocalAdsReview(process.env);
+const stripe = localAdsReview
+  ? (localAdsReview.stripeKey ? new Stripe(localAdsReview.stripeKey) : null)
+  : new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
+if (localAdsReview) {
+  app.use(localAdsReview.requestGuard);
+}
 
 /* ===================================================== */
 /* 🌐 CORS - TUNEVORA WEB                               */
@@ -1387,99 +1392,95 @@ function campaignPricing(campaign) {
   };
 }
 
+async function requireAdPaymentUser(req, claimedUserId) {
+  const user = await authenticateSupabaseRequest(req);
+  if (claimedUserId && String(claimedUserId) !== String(user.id)) {
+    const error = new Error("This payment request belongs to another user");
+    error.statusCode = 403;
+    throw error;
+  }
+  return user.id;
+}
+
+async function finalizeVerifiedAdvertisement({ userId, campaignId, provider, reference, amount, currency }) {
+  const { data, error } = await supabase.rpc("finalize_advertisement_payment", {
+    p_user_id: userId,
+    p_campaign_id: campaignId,
+    p_provider: provider,
+    p_transaction_reference: reference,
+    p_amount: amount,
+    p_currency: normalizeCurrency(currency),
+  });
+  if (error) throw error;
+  if (!data?.success) throw new Error("Advertisement payment was not finalized");
+  return { ...data, paymentType: PAYMENT_TYPES.ADVERTISEMENT };
+}
+
 async function finalizeStripeAdvertisement(paymentIntent) {
-  const userId = String(
-    paymentIntent.metadata?.user_id || ""
-  ).trim();
-
-  const campaignId = String(
-    paymentIntent.metadata?.reference_id ||
-      paymentIntent.metadata?.campaign_id ||
-      ""
-  ).trim();
-
-  if (!userId || !campaignId) {
-    throw new Error(
-      "Invalid Stripe advertisement metadata"
-    );
+  const userId = String(paymentIntent.metadata?.user_id || "").trim();
+  const campaignId = String(paymentIntent.metadata?.reference_id || paymentIntent.metadata?.campaign_id || "").trim();
+  if (!userId || !campaignId || paymentIntent.status !== "succeeded") {
+    throw new Error("Invalid completed Stripe advertisement payment");
   }
+  const currency = normalizeCurrency(paymentIntent.currency);
+  return finalizeVerifiedAdvertisement({
+    userId, campaignId, provider: "Stripe", reference: paymentIntent.id,
+    amount: smallestUnitToAmount(paymentIntent.amount_received, currency), currency,
+  });
+}
 
-  const campaign =
-    await loadCampaignForPayment(campaignId);
+async function loadTrustedPayPalAdOrder(orderID) {
+  const accessToken = await getAccessToken();
+  const response = await axios.get(
+    `${PAYPAL_BASE_URL}/v2/checkout/orders/${encodeURIComponent(orderID)}`,
+    { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 30000 }
+  );
+  return response.data;
+}
 
-  if (String(campaign.created_by) !== userId) {
-    throw new Error(
-      "Stripe campaign ownership verification failed"
-    );
+async function finalizePayPalAdvertisement(orderID, expectedUserId = null, trustedOrder = null) {
+  let order = trustedOrder || await loadTrustedPayPalAdOrder(orderID);
+  const unit = order.purchase_units?.[0];
+  let metadata;
+  try { metadata = JSON.parse(unit?.custom_id || "{}"); }
+  catch (_) { throw new Error("Invalid PayPal advertisement metadata"); }
+  const userId = String(metadata.user_id || "");
+  const campaignId = String(metadata.reference_id || metadata.campaign_id || "");
+  if (metadata.payment_type !== PAYMENT_TYPES.ADVERTISEMENT || !userId || !campaignId ||
+      (expectedUserId && expectedUserId !== userId)) {
+    const error = new Error("PayPal advertisement ownership verification failed");
+    error.statusCode = 403;
+    throw error;
   }
-
-  if (
-    String(campaign.payment_status || "")
-      .toLowerCase() === "paid"
-  ) {
-    return {
-      duplicate: true,
-      paymentType: PAYMENT_TYPES.ADVERTISEMENT,
-    };
-  }
-
+  const campaign = await loadCampaignForPayment(campaignId);
   const pricing = campaignPricing(campaign);
-  const paidCurrency = normalizeCurrency(
-    paymentIntent.currency
-  );
-  const paidAmount = smallestUnitToAmount(
-    paymentIntent.amount_received,
-    paidCurrency
-  );
-
-  if (
-    paidCurrency !== pricing.currency ||
-    !amountsMatch(paidAmount, pricing.amount)
-  ) {
-    throw new Error(
-      "Stripe advertisement amount or currency verification failed"
-    );
+  if (String(campaign.created_by) !== userId ||
+      normalizeCurrency(unit?.amount?.currency_code) !== pricing.currency ||
+      !amountsMatch(unit?.amount?.value, pricing.amount)) {
+    const error = new Error("PayPal advertisement pricing or owner did not match");
+    error.statusCode = 403;
+    throw error;
   }
-
-  const {
-    error: updateError,
-  } = await supabase
-    .from("ad_campaigns")
-    .update({
-      payment_status: "paid",
-      payment_id: paymentIntent.id,
-    })
-    .eq("id", campaignId)
-    .eq("created_by", userId);
-
-  if (updateError) {
-    throw updateError;
+  // Ownership is checked against the authenticated caller BEFORE capture.
+  if (order.status === "APPROVED") {
+    if (campaign.payment_status === "paid" && campaign.payment_id !== orderID) {
+      throw new Error("Campaign was already paid by another transaction");
+    }
+    try { order = (await capturePayPalOrder(orderID)).data; }
+    catch (error) {
+      order = await loadTrustedPayPalAdOrder(orderID);
+      if (order.status !== "COMPLETED") throw error;
+    }
   }
-
-  await recordCommercePayment({
-    userId,
-    purchaseType: PAYMENT_TYPES.ADVERTISEMENT,
-    amount: paidAmount,
-    currency: paidCurrency,
-    method: "Stripe",
-    reference: paymentIntent.id,
-    stripePaymentIntentId: paymentIntent.id,
+  const captured = paypalCaptureData({ data: order });
+  if (captured.status !== "COMPLETED" || captured.captureDetails?.status !== "COMPLETED" ||
+      captured.currency !== pricing.currency || !amountsMatch(captured.amount, pricing.amount)) {
+    throw new Error("Advertisement capture is incomplete or does not match the campaign");
+  }
+  return finalizeVerifiedAdvertisement({
+    userId, campaignId, provider: "PayPal", reference: orderID,
+    amount: captured.amount, currency: captured.currency,
   });
-
-  await recordAdminRevenue({
-    source: "advertisement",
-    amount: paidAmount,
-    currency: paidCurrency,
-  });
-
-  console.log(
-    `✅ STRIPE AD CAMPAIGN PAID: ${campaignId}`
-  );
-
-  return {
-    duplicate: false,
-    paymentType: PAYMENT_TYPES.ADVERTISEMENT,
-  };
 }
 
 async function finalizeStripePayment(paymentIntent) {
@@ -1534,7 +1535,10 @@ async function createPayPalOrder({
           description,
           amount: {
             currency_code: normalizedCurrency,
-            value: numericAmount.toFixed(2),
+            value: numericAmount.toFixed(
+              metadata?.payment_type === PAYMENT_TYPES.ADVERTISEMENT &&
+              ["HUF", "JPY", "TWD"].includes(normalizedCurrency) ? 0 : 2
+            ),
           },
         },
       ],
@@ -1701,6 +1705,10 @@ app.post(
       return res.status(400).send(
         `Webhook Error: ${error.message}`
       );
+    }
+
+    if (localAdsReview && !localAdsReview.acceptsWebhook(event)) {
+      return res.json({ received: true, ignored: true });
     }
 
     try {
@@ -2035,6 +2043,9 @@ return res.status(200).json({
 );
 
 app.use(bodyParser.json());
+if (localAdsReview) {
+  app.use(localAdsReview.bodyGuard);
+}
 
 app.post(
   "/google-play-rtdn",
@@ -3029,11 +3040,11 @@ async function finalizePayPalSubscriptionOrderFromWebhook(
     .trim()
     .toLowerCase();
 
-/*
- * Ticket and advertisement PayPal
- * orders use their own capture flows.
- * This helper handles subscriptions only.
- */
+if (paymentType === PAYMENT_TYPES.ADVERTISEMENT) {
+  return finalizePayPalAdvertisement(normalizedOrderID, null, orderData);
+}
+
+/* Ticket orders retain their existing capture flow. */
 if (
   paymentType !==
   PAYMENT_TYPES.SUBSCRIPTION
@@ -4519,6 +4530,9 @@ app.post(
         });
       }
 
+      if (paymentType === PAYMENT_TYPES.ADVERTISEMENT) {
+        await requireAdPaymentUser(req, user_id);
+      }
       await loadProfile(user_id);
 
       let amount;
@@ -4700,7 +4714,9 @@ app.post(
           payment_intent_data: {
             metadata,
           },
-        });
+        }, paymentType === PAYMENT_TYPES.ADVERTISEMENT
+          ? { idempotencyKey: `ad-checkout-${reference_id}` }
+          : undefined);
 
       return res.json({
         success: true,
@@ -4716,7 +4732,7 @@ app.post(
         error
       );
 
-      return res.status(500).json({
+      return res.status(Number(error.statusCode) || 500).json({
         error:
           error.message ||
           "Could not create Stripe Checkout session",
@@ -5228,291 +5244,33 @@ app.post(
 /* 📢 CREATE STRIPE AD PAYMENT INTENT */
 /* ===================================================== */
 
-app.post(
-  "/create-ad-payment-intent",
-  async (req, res) => {
-    try {
-      console.log(
-        "🔥 CREATE AD PAYMENT INTENT"
-      );
-
-      const {
-        user_id,
-        campaign_id,
-      } = req.body;
-
-      /* --------------------------------------------- */
-      /* Validate required request data                */
-      /* --------------------------------------------- */
-
-      if (!user_id || !campaign_id) {
-        return res.status(400).json({
-          error:
-            "Missing user_id or campaign_id",
-        });
-      }
-
-      /* --------------------------------------------- */
-      /* Load real campaign values from Supabase       */
-      /* --------------------------------------------- */
-
-      const {
-        data: campaign,
-        error: campaignError,
-      } = await supabase
-        .from("ad_campaigns")
-        .select(`
-          id,
-          ad_id,
-          budget,
-          currency,
-          created_by,
-          payment_status,
-          payment_id,
-          status
-        `)
-        .eq("id", campaign_id)
-        .maybeSingle();
-
-      if (campaignError) {
-        console.log(
-          "❌ LOAD AD CAMPAIGN ERROR:",
-          campaignError
-        );
-
-        return res.status(500).json({
-          error:
-            "Could not load advertisement campaign",
-          details:
-            campaignError.message,
-        });
-      }
-
-      if (!campaign) {
-        return res.status(404).json({
-          error:
-            "Advertisement campaign not found",
-        });
-      }
-
-      /* --------------------------------------------- */
-      /* Verify the campaign belongs to this user      */
-      /* --------------------------------------------- */
-      
-      console.log(
-         "🔐 CAMPAIGN OWNERSHIP CHECK:",
-         {
-          campaign_created_by:
-            campaign.created_by,
-          request_user_id:
-            user_id,
-          matches:
-            campaign.created_by === user_id,
-        }
-      );    
-
-      if (campaign.created_by !== user_id) {
-        return res.status(403).json({
-          error:
-            "You are not allowed to pay for this campaign",
-        });
-      }
-
-      /* --------------------------------------------- */
-      /* Prevent paying an already-paid campaign       */
-      /* --------------------------------------------- */
-
-      if (
-        String(
-          campaign.payment_status || ""
-        ).toLowerCase() === "paid"
-      ) {
-        return res.status(409).json({
-          error:
-            "This campaign has already been paid",
-          payment_id:
-            campaign.payment_id,
-        });
-      }
-
-      /* --------------------------------------------- */
-      /* Use server-side database budget               */
-      /* --------------------------------------------- */
-
-      const campaignBudget =
-        Number(campaign.budget);
-
-      if (
-        !Number.isFinite(campaignBudget) ||
-        campaignBudget <= 0
-      ) {
-        return res.status(400).json({
-          error:
-            "Campaign budget is invalid",
-        });
-      }
-
-      const paymentCurrency =
-        String(campaign.currency || "USD")
-          .trim()
-          .toUpperCase();
-
-      const stripeCurrency =
-        paymentCurrency.toLowerCase();
-
-      /*
-       * Stripe expects the amount in the
-       * smallest currency unit.
-       *
-       * Example:
-       * 100 AED -> 10000 fils
-       */
-      const amountInSmallestUnit =
-        Math.round(
-          campaignBudget * 100
-        );
-
-      if (
-        !Number.isInteger(
-          amountInSmallestUnit
-        ) ||
-        amountInSmallestUnit <= 0
-      ) {
-        return res.status(400).json({
-          error:
-            "Invalid campaign payment amount",
-        });
-      }
-
-      console.log(
-        "📢 AD CAMPAIGN PAYMENT:",
-        {
-          campaign_id:
-            campaign.id,
-          user_id,
-          budget:
-            campaignBudget,
-          currency:
-            paymentCurrency,
-          smallest_unit:
-            amountInSmallestUnit,
-        }
-      );
-
-      /* --------------------------------------------- */
-      /* Create Stripe PaymentIntent                   */
-      /* --------------------------------------------- */
-
-      const paymentIntent =
-        await stripe
-          .paymentIntents
-          .create({
-            amount:
-              amountInSmallestUnit,
-
-            currency:
-              stripeCurrency,
-
-            automatic_payment_methods: {
-              enabled: true,
-            },
-
-            metadata: {
-              payment_type:
-                PAYMENT_TYPES.ADVERTISEMENT,
-
-              user_id,
-
-              reference_id:
-                campaign.id,
-
-              campaign_id:
-                campaign.id,
-
-              ad_id:
-                campaign.ad_id || "",
-
-              campaign_budget:
-                campaignBudget.toFixed(2),
-
-              campaign_currency:
-                paymentCurrency.toUpperCase(),
-            },
-          });
-
-      /* --------------------------------------------- */
-      /* Save PaymentIntent ID before payment          */
-      /* --------------------------------------------- */
-
-      const {
-        error: updateError,
-      } = await supabase
-        .from("ad_campaigns")
-        .update({
-          payment_id:
-            paymentIntent.id,
-        })
-        .eq("id", campaign.id)
-        .eq("created_by", user_id);
-
-      if (updateError) {
-        console.log(
-          "❌ SAVE AD PAYMENT ID ERROR:",
-          updateError
-        );
-
-        /*
-         * Cancel the PaymentIntent so we do not leave
-         * an untracked payment open in Stripe.
-         */
-        try {
-          await stripe
-            .paymentIntents
-            .cancel(paymentIntent.id);
-        } catch (cancelError) {
-          console.log(
-            "⚠️ PAYMENT INTENT CANCEL ERROR:",
-            cancelError.message
-          );
-        }
-
-        return res.status(500).json({
-          error:
-            "Could not prepare advertisement payment",
-          details:
-            updateError.message,
-        });
-      }
-
-      return res.json({
-        clientSecret:
-          paymentIntent.client_secret,
-
-        paymentIntentId:
-          paymentIntent.id,
-
-        amount:
-          campaignBudget,
-
-        currency:
-          paymentCurrency,
-      });
-    } catch (error) {
-      console.log(
-        "❌ AD STRIPE ERROR:",
-        error
-      );
-
-      return res.status(500).json({
-        error:
-          error.message ||
-          "Advertisement payment intent failed",
-      });
-    }
+app.post("/create-ad-payment-intent", async (req, res) => {
+  try {
+    const userId = await requireAdPaymentUser(req, req.body?.user_id);
+    const campaignId = String(req.body?.campaign_id || "");
+    if (!campaignId) return res.status(400).json({ error: "Missing campaign_id" });
+    const campaign = await loadCampaignForPayment(campaignId);
+    if (String(campaign.created_by) !== userId) return res.status(403).json({ error: "This campaign belongs to another user" });
+    if (campaign.payment_status === "paid") return res.status(409).json({ error: "Campaign already paid" });
+    const pricing = campaignPricing(campaign);
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountToSmallestUnit(pricing.amount, pricing.currency),
+      currency: pricing.currency.toLowerCase(),
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        payment_type: PAYMENT_TYPES.ADVERTISEMENT, user_id: userId,
+        reference_id: campaignId, campaign_id: campaignId, ad_id: String(campaign.ad_id || ""),
+      },
+    }, { idempotencyKey: `ad-intent-${campaignId}` });
+    const { error } = await supabase.from("ad_campaigns")
+      .update({ payment_id: paymentIntent.id }).eq("id", campaignId).eq("created_by", userId);
+    if (error) throw error; // Same idempotency key recovers this intent on retry.
+    return res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id,
+      amount: pricing.amount, currency: pricing.currency });
+  } catch (error) {
+    return res.status(Number(error.statusCode) || 500).json({ error: error.message || "Could not prepare ad payment" });
   }
-);
-
-
+});
 
 /* ===================================================== */
 /* 🎫 CREATE PAYPAL TICKET ORDER                         */
@@ -5770,283 +5528,44 @@ app.post(
 /* 📢 CREATE PAYPAL AD ORDER                             */
 /* ===================================================== */
 
-app.post(
-  "/create-ad-order",
-  async (req, res) => {
-    try {
-      const {
-        user_id,
-        campaign_id,
-      } = req.body || {};
-
-      if (!user_id || !campaign_id) {
-        return res.status(400).json({
-          error:
-            "Missing user_id or campaign_id",
-        });
-      }
-
-      const campaign =
-        await loadCampaignForPayment(
-          campaign_id
-        );
-
-      if (
-        String(campaign.created_by) !==
-        String(user_id)
-      ) {
-        return res.status(403).json({
-          error:
-            "This campaign belongs to another user",
-        });
-      }
-
-      if (
-        String(campaign.payment_status || "")
-          .toLowerCase() === "paid"
-      ) {
-        return res.status(409).json({
-          error:
-            "This campaign has already been paid",
-        });
-      }
-
-      const pricing =
-        campaignPricing(campaign);
-
-      const metadata = {
-        payment_type:
-          PAYMENT_TYPES.ADVERTISEMENT,
-        user_id,
-        reference_id:
-          String(campaign.id),
-        campaign_id:
-          String(campaign.id),
-        ad_id:
-          String(campaign.ad_id || ""),
-      };
-
-      const order = await createPayPalOrder({
-        description:
-          "Tunevora advertisement campaign",
-        amount: pricing.amount,
-        currency: pricing.currency,
-        metadata,
-        returnUrl: "tunevora://ad-success",
-        cancelUrl: "tunevora://ad-cancel",
-      });
-
-      const {
-        error: updateError,
-      } = await supabase
-        .from("ad_campaigns")
-        .update({
-          payment_id: order.id,
-        })
-        .eq("id", campaign.id)
-        .eq("created_by", user_id);
-
-      if (updateError) {
-        throw updateError;
-      }
-
-      return res.json({
-        ...order,
-        amount: pricing.amount,
-        currency: pricing.currency,
-      });
-    } catch (error) {
-      console.log(
-        "❌ CREATE PAYPAL AD ERROR:",
-        error.response?.data ||
-          error.message
-      );
-
-      return res.status(500).json({
-        error:
-          error.message ||
-          "Could not create advertisement order",
-      });
+app.post("/create-ad-order", async (req, res) => {
+  try {
+    const userId = await requireAdPaymentUser(req, req.body?.user_id);
+    const campaignId = String(req.body?.campaign_id || "");
+    if (!campaignId) return res.status(400).json({ error: "Missing campaign_id" });
+    const campaign = await loadCampaignForPayment(campaignId);
+    if (String(campaign.created_by) !== userId) return res.status(403).json({ error: "This campaign belongs to another user" });
+    if (campaign.payment_status === "paid") return res.status(409).json({ error: "Campaign already paid" });
+    const pricing = campaignPricing(campaign);
+    if (!PAYPAL_SUPPORTED_CURRENCIES.has(pricing.currency)) {
+      return res.status(422).json({ error: `PayPal does not support ${pricing.currency} campaign payments. Please use Stripe.` });
     }
+    const base = paymentPublicBaseUrl(req);
+    const order = await createPayPalOrder({
+      description: "Tunevora advertisement campaign", amount: pricing.amount, currency: pricing.currency,
+      metadata: { payment_type: PAYMENT_TYPES.ADVERTISEMENT, user_id: userId, reference_id: campaignId },
+      returnUrl: `${base}/payment-success`, cancelUrl: `${base}/payment-cancel`,
+    });
+    const { error } = await supabase.from("ad_campaigns").update({ payment_id: order.id })
+      .eq("id", campaignId).eq("created_by", userId);
+    if (error) throw error;
+    return res.json({ ...order, amount: pricing.amount, currency: pricing.currency });
+  } catch (error) {
+    return res.status(Number(error.statusCode) || 500).json({ error: error.message || "Could not create ad order" });
   }
-);
+});
 
-/* ===================================================== */
-/* 📢 CAPTURE PAYPAL AD ORDER                            */
-/* ===================================================== */
-
-app.post(
-  "/capture-ad-order",
-  async (req, res) => {
-    try {
-      const {
-        orderID,
-        user_id,
-      } = req.body || {};
-
-      if (!orderID || !user_id) {
-        return res.status(400).json({
-          error:
-            "Missing orderID or user_id",
-        });
-      }
-
-      const existing =
-        await findPaymentByReference(
-          orderID
-        );
-
-      if (existing) {
-        if (
-          String(existing.user_id) !==
-          String(user_id)
-        ) {
-          return res.status(403).json({
-            error:
-              "This order belongs to another user",
-          });
-        }
-
-        return res.json({
-          success: true,
-          duplicate: true,
-          transaction_reference:
-            orderID,
-        });
-      }
-
-      const captureResponse =
-        await capturePayPalOrder(orderID);
-
-      const captured =
-        paypalCaptureData(
-          captureResponse
-        );
-
-      if (captured.status !== "COMPLETED") {
-        return res.status(400).json({
-          error:
-            "Advertisement payment was not completed",
-          status: captured.status,
-        });
-      }
-
-      const paymentType = String(
-        captured.metadata.payment_type ||
-          ""
-      )
-        .trim()
-        .toLowerCase();
-
-      const metadataUserId = String(
-        captured.metadata.user_id || ""
-      ).trim();
-
-      const campaignId = String(
-        captured.metadata.reference_id ||
-          captured.metadata.campaign_id ||
-          ""
-      ).trim();
-
-      if (
-        paymentType !==
-          PAYMENT_TYPES.ADVERTISEMENT ||
-        metadataUserId !==
-          String(user_id) ||
-        !campaignId
-      ) {
-        return res.status(403).json({
-          error:
-            "PayPal advertisement metadata verification failed",
-        });
-      }
-
-      const campaign =
-        await loadCampaignForPayment(
-          campaignId
-        );
-      const pricing =
-        campaignPricing(campaign);
-
-      if (
-        String(campaign.created_by) !==
-        String(user_id)
-      ) {
-        return res.status(403).json({
-          error:
-            "Campaign ownership verification failed",
-        });
-      }
-
-      if (
-        captured.currency !==
-          pricing.currency ||
-        !amountsMatch(
-          captured.amount,
-          pricing.amount
-        )
-      ) {
-        return res.status(400).json({
-          error:
-            "PayPal advertisement amount or currency did not match",
-        });
-      }
-
-      const {
-        error: updateError,
-      } = await supabase
-        .from("ad_campaigns")
-        .update({
-          payment_status: "paid",
-          payment_id: orderID,
-        })
-        .eq("id", campaignId)
-        .eq("created_by", user_id);
-
-      if (updateError) {
-        throw updateError;
-      }
-
-      await recordCommercePayment({
-        userId: user_id,
-        purchaseType:
-          PAYMENT_TYPES.ADVERTISEMENT,
-        amount: captured.amount,
-        currency: captured.currency,
-        method: "PayPal",
-        reference: orderID,
-      });
-
-      await recordAdminRevenue({
-        source: "advertisement",
-        amount: captured.amount,
-        currency: captured.currency,
-      });
-
-      return res.json({
-        success: true,
-        campaign_id: campaignId,
-        amount: captured.amount,
-        currency: captured.currency,
-        transaction_reference:
-          orderID,
-      });
-    } catch (error) {
-      console.log(
-        "❌ CAPTURE PAYPAL AD ERROR:",
-        error.response?.data ||
-          error.message
-      );
-
-      return res.status(500).json({
-        error:
-          error.message ||
-          "Advertisement capture failed",
-      });
-    }
+app.post("/capture-ad-order", async (req, res) => {
+  try {
+    const userId = await requireAdPaymentUser(req, req.body?.user_id);
+    const orderID = String(req.body?.orderID || "").trim();
+    if (!orderID) return res.status(400).json({ error: "Missing orderID" });
+    const result = await finalizePayPalAdvertisement(orderID, userId);
+    return res.json({ ...result, transaction_reference: orderID });
+  } catch (error) {
+    return res.status(Number(error.statusCode) || 500).json({ error: error.message || "Could not finalize ad payment" });
   }
-);
-
+});
 
 /* ===================================================== */
 /* 🍎 VERIFY APPLE NON-RENEWING SUBSCRIPTION             */
@@ -7494,7 +7013,8 @@ app.get("/", (req, res) => {
 const PORT =
   process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+const listenArguments = localAdsReview ? [PORT, "127.0.0.1"] : [PORT];
+app.listen(...listenArguments, () => {
   console.log(
     `🚀 Server running on port ${PORT}`
   );
